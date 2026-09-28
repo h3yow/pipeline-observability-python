@@ -13,7 +13,13 @@
   不再重试、不再接受后续尝试上报。
 - **状态汇总与告警收敛**：同一异常恢复前只告警一次；逐实例加锁 + 锁内构造不可变
   快照，并发查询看不到中间态，更新不丢失。
-- **时效性判定**：以最近成功时间为基线（从未成功则回退首次事件时间）。
+- **管道级健康汇总**：按 `pipeline_id` 聚合其下多次运行——最近一次运行状态、最近成功
+  时间、最近成功之后的连续失败运行数、当前活动告警及原因。聚合在写入时增量物化，
+  健康查询 O(1)、不随历史实例数线性变慢；快照在管道锁内一次性构造。
+- **失新鲜监控（两类告警分开）**：以最近成功时间为基线（从未成功则用第一次上报时间），
+  超阈值即产生独立的**失新鲜告警**，与**失败告警**可并存、各自恢复；同一段失新鲜只告警/
+  计数一次，重新成功即关闭。阈值可配置，巡检可用注入时钟/显式 `now` 确定性触发，无需
+  真实 sleep。
 
 ## 运行
 
@@ -30,12 +36,25 @@ from pipeline_obs import (
     ObservabilityService, RetryPolicy, PipelineEvent, EventType, ErrorClass,
 )
 
-svc = ObservabilityService(retry_policy=RetryPolicy(max_attempts=3))
-svc.ingest(PipelineEvent("run-1", "e1", EventType.STARTED, occurred_at=1.0, version=1))
-r = svc.ingest(PipelineEvent("run-1", "e2", EventType.FAILED, occurred_at=2.0,
-                             version=2, attempt=1, error_class=ErrorClass.RETRYABLE))
-print(r.status, r.state, r.retry.should_retry, r.retry.delay_seconds)
-print(svc.status("run-1"))
+svc = ObservabilityService(retry_policy=RetryPolicy(max_attempts=3),
+                           fresh_within_seconds=300.0)  # 失新鲜阈值可配置
+
+# 同一管道下的多个运行通过 pipeline_id 归组（不传则该实例自成一管道，兼容旧用法）
+svc.ingest(PipelineEvent("run-1", "e1", EventType.STARTED, occurred_at=1.0,
+                         version=1, pipeline_id="pipe-A"))
+svc.ingest(PipelineEvent("run-1", "e2", EventType.FAILED, occurred_at=2.0,
+                         version=2, attempt=1, error_class=ErrorClass.RETRYABLE,
+                         pipeline_id="pipe-A"))
+
+# 管道健康（O(1) 物化聚合）
+print(svc.pipeline_health("pipe-A"))
+# 活动告警明细（失败/失新鲜分列）：service.active_alerts("pipe-A")
+
+# 确定性失新鲜巡检（注入时刻，不靠 sleep）
+verdict = svc.check_staleness("run-1", now=400.0)
+print(verdict.stale, verdict.baseline_kind, verdict.age_seconds, verdict.reason)
+# 也可按管道/全量巡检：svc.sweep_staleness(pipeline_id="pipe-A", now=400.0)
 ```
 
-详细规则见 [`docs/design.md`](docs/design.md)。
+旧的单实例用法（不传 `pipeline_id`、`service.status(run_id)`、`staleness_report(...)`
+等）保持不变，详见 [`docs/design.md`](docs/design.md)。
