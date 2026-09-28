@@ -58,4 +58,49 @@ def log_snapshot(snap) -> None:
         snap.next_retry_at,
     )
     if snap.alert_reason:
-        timeline_log.info("        告警依据: %s", snap.alert_reason)
+        timeline_log.info("        失败告警依据: %s", snap.alert_reason)
+    if snap.staleness_assessment is not None:
+        a = snap.staleness_assessment
+        timeline_log.info(
+            "        失新鲜判定: stale=%s 基线=%s 基线时间=%s 距今=%ss 阈值=%ss",
+            a.stale, a.basis, a.basis_time, a.age_seconds, a.threshold_seconds,
+        )
+    if snap.staleness_alert_reason:
+        timeline_log.info("        失新鲜告警依据: %s", snap.staleness_alert_reason)
+
+
+def log_pipeline_health(health) -> None:
+    """打印管道级健康汇总时间线。"""
+    timeline_log.info(
+        "        管道[%s] 健康: 最近运行=%s(%s) 最近事件@%s 最近成功=%s "
+        "连续失败=%d 失败告警=%s 失新鲜告警=%s 保留实例=%d(上限%d,累计淘汰%d)",
+        health.pipeline_id,
+        health.latest_run_id,
+        health.latest_state.value if health.latest_state else None,
+        health.latest_event_at,
+        health.last_success_at,
+        health.consecutive_failures,
+        health.failure_alert_active,
+        health.staleness_alert_active,
+        health.run_count,
+        health.retained_run_limit,
+        health.evicted_runs,
+    )
+    for a in health.active_alerts:
+        if a.kind.value == "FAILURE":
+            timeline_log.info(
+                "          活动告警[失败] run=%s 错误分类=%s 原因=%s",
+                a.pipeline_run_id,
+                a.error_class.value if a.error_class else None,
+                a.reason,
+            )
+        else:
+            timeline_log.info(
+                "          活动告警[失新鲜] run=%s 基线=%s@%s 差=%ss 阈值=%ss 原因=%s",
+                a.pipeline_run_id,
+                a.basis,
+                a.basis_time,
+                a.age_seconds,
+                a.threshold_seconds,
+                a.reason,
+            )

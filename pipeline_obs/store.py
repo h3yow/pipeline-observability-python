@@ -14,7 +14,12 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from .alerting import evaluate_alert
+from .alerting import (
+    assess_staleness,
+    evaluate_alert,
+    evaluate_staleness_alert,
+    recover_staleness_alert_on_success,
+)
 from .models import (
     AlertState,
     ErrorClass,
@@ -26,7 +31,10 @@ from .models import (
     RejectReason,
     RetryDecision,
     RetryPolicy,
+    StalenessAlertState,
+    StalenessAssessment,
 )
+from .pipelines import PipelineRegistry
 from .retry import decide_retry
 
 
@@ -50,6 +58,12 @@ class _RunRecord:
     last_error_class: ErrorClass | None = None
     last_error_message: str | None = None
     alert: AlertState = field(default_factory=AlertState)
+    # 失新鲜告警（与失败告警独立维护）
+    stale_alert: StalenessAlertState = field(default_factory=StalenessAlertState)
+    # 最近一次失新鲜判定（巡检后填充），用于快照与管道汇总里展示判定依据
+    last_staleness_assessment: "StalenessAssessment | None" = field(default=None)
+    # 管道归属（首个带 pipeline_id 的事件确定后不再变更）
+    pipeline_id: str | None = None
 
 
 # 合法状态流转表（依据事件类型）
@@ -123,10 +137,20 @@ class IngestResult:
 class PipelineStore:
     """内存态、线程安全的管道运行观测存储。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        pipeline_registry: PipelineRegistry | None = None,
+        retained_run_limit: int = 1000,
+    ) -> None:
         self._records: dict[str, _RunRecord] = {}
         self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self._registry_lock = threading.Lock()
+        self.pipeline_registry = pipeline_registry or PipelineRegistry(
+            retained_run_limit=retained_run_limit
+        )
+        # 反向注入：管道快照需要读取实例的告警字段
+        self.pipeline_registry._bind_store(self)
 
     def _get_or_create(self, run_id: str) -> _RunRecord:
         # 字典赋值在 CPython 下原子，但显式加注册锁使语义清晰且可移植。
@@ -138,6 +162,17 @@ class PipelineStore:
                     record = _RunRecord(pipeline_run_id=run_id)
                     self._records[run_id] = record
         return record
+
+    # ---- 供 PipelineRegistry 摘除被淘汰实例 ----
+
+    def _discard_record(self, run_id: str) -> None:
+        """保留策略淘汰：从实例注册表摘除（调用方持有 run 锁+pipeline 锁）。
+
+        仅操作 dict（受注册表短锁保护），不获取被淘汰实例的实例锁，
+        以严格遵守 run -> pipeline 的单向锁序。
+        """
+        with self._registry_lock:
+            self._records.pop(run_id, None)
 
     def _snapshot(self, rec: _RunRecord) -> PipelineStatus:
         return PipelineStatus(
@@ -153,6 +188,12 @@ class PipelineStore:
             retry_exhausted=rec.retry_exhausted,
             alert_active=rec.alert.active,
             alert_reason=rec.alert.reason,
+            pipeline_id=rec.pipeline_id,
+            last_error_class=rec.last_error_class,
+            last_error_message=rec.last_error_message,
+            staleness_alert_active=rec.stale_alert.active,
+            staleness_alert_reason=rec.stale_alert.reason,
+            staleness_assessment=rec.last_staleness_assessment,
         )
 
     def ingest_event(
@@ -253,6 +294,7 @@ class PipelineStore:
 
             # 6. 应用事件
             retry_decision = self._apply(rec, event, target, retry_policy=retry_policy)
+            self._post_apply_pipeline(rec, event)
             return IngestResult(
                 IngestStatus.APPLIED,
                 state=rec.state,
@@ -310,6 +352,10 @@ class PipelineStore:
                 retry_exhausted=False,
                 version=event.version,
             )
+            # 成功即恢复新鲜：失新鲜告警即时关闭，无需等待下一次巡检
+            recover_staleness_alert_on_success(
+                rec.stale_alert, last_success_at=event.occurred_at
+            )
             return None
 
         # FAILED
@@ -358,6 +404,97 @@ class PipelineStore:
             version=event.version,
         )
         return decision
+
+    def _post_apply_pipeline(
+        self, rec: _RunRecord, event: PipelineEvent
+    ) -> None:
+        """事件在实例锁内应用后，按 run->pipeline 锁序刷新管道聚合。
+
+        - 管道归属：以首个携带 pipeline_id 的事件为准（first-wins），
+          避免同一实例被并发/重复上报拉扯到不同管道；
+        - 聚合更新与淘汰在同一（run 锁 + pipeline 锁）临界区完成，
+          查询方看不到“实例已更新、聚合未更新”的中间态。
+        """
+        pipeline_id = event.pipeline_id or rec.pipeline_id
+        if pipeline_id is None:
+            return
+        if rec.pipeline_id is None:
+            rec.pipeline_id = event.pipeline_id
+
+        registry = self.pipeline_registry
+        with registry.lock_for(pipeline_id):
+            registry.on_run_applied(pipeline_id, rec.pipeline_run_id)
+            registry.apply_run_update(
+                pipeline_id,
+                run_id=rec.pipeline_run_id,
+                state=rec.state,
+                latest_event_at=rec.latest_event_at or event.occurred_at,
+                version=rec.applied_version,
+                failed_outcome=event.event_type is EventType.FAILED,
+                succeeded=event.event_type is EventType.SUCCEEDED,
+            )
+            victims = registry.evict_if_needed(pipeline_id)
+            for rid in victims:
+                if rid == rec.pipeline_run_id:
+                    # 刚应用事件的实例最新，不可能被淘汰；防御性跳过
+                    continue
+                self._discard_record(rid)
+
+    def sweep_staleness(
+        self,
+        *,
+        now: float,
+        fresh_within_seconds: float,
+        pipeline_id: str | None = None,
+    ) -> list[PipelineStatus]:
+        """确定性失新鲜巡检：按给定 now/阈值评估全部（或指定管道）实例。
+
+        - 不依赖真实 sleep：now 由调用方注入，可在测试中精确推进；
+        - 逐实例加锁评估，同一段失新鲜期间只告警一次、只计一次
+          （收敛逻辑见 alerting.evaluate_staleness_alert）；
+        - 返回巡检后处于失新鲜告警中的实例快照列表。
+        """
+        if pipeline_id is None:
+            with self._registry_lock:
+                run_ids = list(self._records.keys())
+        else:
+            run_ids = self.pipeline_registry.member_ids_locked(pipeline_id)
+            if run_ids is None:
+                return []
+
+        stale_snaps: list[PipelineStatus] = []
+        for run_id in run_ids:
+            snap = self.evaluate_run_staleness(
+                run_id,
+                now=now,
+                fresh_within_seconds=fresh_within_seconds,
+            )
+            if snap is not None and snap.staleness_alert_active:
+                stale_snaps.append(snap)
+        return stale_snaps
+
+    def evaluate_run_staleness(
+        self,
+        run_id: str,
+        *,
+        now: float,
+        fresh_within_seconds: float,
+    ) -> PipelineStatus | None:
+        """对单个实例执行一次失新鲜判定并收敛其失新鲜告警；返回最新快照。"""
+        with self._registry_lock:
+            rec = self._records.get(run_id)
+        if rec is None:
+            return None
+        with self._locks[run_id]:
+            assessment = assess_staleness(
+                last_success_at=rec.last_success_at,
+                started_at=rec.started_at,
+                now=now,
+                fresh_within_seconds=fresh_within_seconds,
+            )
+            rec.last_staleness_assessment = assessment
+            evaluate_staleness_alert(rec.stale_alert, assessment)
+            return self._snapshot(rec)
 
     def get_status(self, run_id: str) -> PipelineStatus | None:
         """读取一致的状态汇总快照；不存在返回 None。"""
