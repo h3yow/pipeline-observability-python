@@ -39,6 +39,22 @@ class RejectReason(str, Enum):
     FATAL_ALREADY_TERMINAL = "FATAL_ALREADY_TERMINAL"  # 实例已进入不可重试终态
     RETRY_EXHAUSTED = "RETRY_EXHAUSTED"          # 可重试失败已达次数上限，不得再调度
     CONFLICTING_OUTCOME = "CONFLICTING_OUTCOME"  # 同一 attempt 收到互相冲突的结果上报
+    RUN_EVICTED = "RUN_EVICTED"                  # 运行已被保留策略淘汰，不再接收事件
+
+
+class FailureTerminalReason(str, Enum):
+    """失败终止的两类可区分原因。"""
+
+    NON_RETRYABLE = "NON_RETRYABLE"      # 错误本身不可重试（FATAL），立即终止
+    RETRY_EXHAUSTED = "RETRY_EXHAUSTED"  # 错误可重试，但重试机会已用尽
+
+
+class LookupStatus(str, Enum):
+    """单运行查询的归属结论。"""
+
+    PRESENT = "PRESENT"    # 运行在保留窗口内，snapshot 有效
+    EVICTED = "EVICTED"    # 运行曾被观测到，但已按保留策略淘汰
+    UNKNOWN = "UNKNOWN"    # 从未观测到该运行
 
 
 class AlertKind(str, Enum):
@@ -138,6 +154,14 @@ class PipelineStatus:
     staleness_alert_reason: str | None = None   # 失新鲜告警的当前判定依据
     staleness_raised_count: int = 0             # 失新鲜告警累计次数（每段失新鲜只计一次）
     active_alert_kinds: tuple[str, ...] = ()    # 当前活动告警类别（FAILURE / STALENESS）
+    # —— 失败原因可见性（同样追加在末尾、带默认值，旧构造不受影响）——
+    last_error_class: str | None = None         # 最近一次失败的错误分类（从未失败/已恢复成功后为 None）
+    last_error_message: str | None = None       # 最近一次失败的错误信息（清空时机同上）
+    failure_terminal_reason: str | None = None  # 终止原因：NON_RETRYABLE / RETRY_EXHAUSTED（非终止态为 None）
+    last_failure_at: float | None = None        # 最近一次失败事件时间（清空时机同上）
+    # —— 失新鲜恢复明细（活动状态与判定依据保持同一版结论）——
+    staleness_recovered_at: float | None = None  # 最近一次从失新鲜恢复新鲜的时刻
+    staleness_recovery_reason: str | None = None  # 恢复/新鲜结论的判定依据（与活动标志同版）
 
 
 @dataclass(frozen=True)
@@ -164,6 +188,8 @@ class StalenessAlertState:
     last_checked_at: float | None = None     # 最近一次巡检时刻
     last_verdict: StalenessVerdict | None = None  # 最近一次判定结论（含依据）
     last_recovered_at: float | None = None   # 最近一次恢复新鲜的时刻
+    last_recovery_reason: str | None = None  # 最近一次恢复/新鲜结论的判定依据（与活动标志同版）
+    last_threshold_seconds: float | None = None  # 最近一次巡检所用阈值（供成功即时恢复复用）
 
 
 @dataclass(frozen=True)
@@ -175,6 +201,11 @@ class ActiveAlertView:
     reason: str
     since: float | None          # 告警首次产生的时间
     version: int | None = None   # 触发告警的事件版本（失败告警）
+    # —— 失败告警携带的最近一次失败原因（失新鲜告警恒为 None）——
+    error_class: str | None = None       # 错误分类（RETRYABLE / FATAL）
+    error_message: str | None = None     # 错误信息
+    failure_terminal_reason: str | None = None  # NON_RETRYABLE / RETRY_EXHAUSTED
+    last_failure_at: float | None = None        # 最近一次失败事件时间
 
 
 @dataclass(frozen=True)
@@ -199,3 +230,31 @@ class PipelineHealth:
     has_staleness_alert: bool                       # 当前是否有失新鲜告警
     staleness_threshold_seconds: float | None       # 巡检所用新鲜阈值（未巡检为 None）
     checked_at: float | None                        # 最近一次失新鲜巡检时刻
+    # —— 管道维度“最近一次为什么挂”（追加字段，带默认值，旧构造兼容）——
+    latest_failure_run_id: str | None = None        # 管道最近一次仍未恢复的失败运行
+    latest_failure_at: float | None = None          # 该失败的事件时间
+    latest_error_class: str | None = None           # 该失败的错误分类
+    latest_error_message: str | None = None         # 该失败的错误信息
+    latest_failure_terminal_reason: str | None = None  # NON_RETRYABLE / RETRY_EXHAUSTED
+    # —— 保留与淘汰披露（追加字段，带默认值）——
+    retention: RetentionInfo | None = None        # 保留口径（上限；None 表示不设上限）
+    evicted_run_count: int = 0                      # 该管道累计被淘汰的运行数
+
+
+@dataclass(frozen=True)
+class RetentionInfo:
+    """历史保留口径对外披露。"""
+
+    max_runs: int | None            # 每个服务实例最多保留的不同运行数；None 表示不设上限
+    current_runs: int               # 当前保留中的运行数
+    total_evicted_runs: int         # 服务启动以来累计淘汰的运行数
+
+
+@dataclass(frozen=True)
+class RunLookup:
+    """单运行查询的一致结果：在窗口内 / 已淘汰 / 从未见过，三态明确、不报错。"""
+
+    status: LookupStatus
+    snapshot: PipelineStatus | None = None   # status=PRESENT 时有效
+    run_id: str | None = None                # 被淘汰/未知的运行 ID
+    detail: str | None = None                # 淘汰说明等可读信息

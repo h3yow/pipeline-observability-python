@@ -7,12 +7,15 @@ from collections.abc import Callable
 
 from .alerting import staleness
 from .models import (
+    LookupStatus,
     PipelineEvent,
     PipelineHealth,
+    RetentionInfo,
     RetryPolicy,
+    RunLookup,
     StalenessVerdict,
 )
-from .store import IngestResult, PipelineStore
+from .store import DEFAULT_MAX_RUNS, IngestResult, PipelineStore
 
 
 class ObservabilityService:
@@ -21,6 +24,9 @@ class ObservabilityService:
     fresh_within_seconds：失新鲜阈值（秒），全局默认值，可在构造时配置；
     单次巡检也可显式传入阈值覆盖。巡检时刻一律取自注入时钟 clock，
     因此测试可注入可控时钟、按需确定性触发，不依赖真实 sleep。
+
+    max_runs：内存态历史保留上限（不同运行实例数，默认 DEFAULT_MAX_RUNS）；
+    超出后淘汰最近事件时间最旧的运行。传 None 表示不设上限（旧行为）。
     """
 
     def __init__(
@@ -30,10 +36,11 @@ class ObservabilityService:
         store: PipelineStore | None = None,
         clock: Callable[[], float] = time.monotonic,
         fresh_within_seconds: float = 300.0,
+        max_runs: int | None = DEFAULT_MAX_RUNS,
     ) -> None:
         if fresh_within_seconds <= 0:
             raise ValueError("fresh_within_seconds 必须为正数")
-        self._store = store or PipelineStore()
+        self._store = store or PipelineStore(max_runs=max_runs)
         self.retry_policy = retry_policy or RetryPolicy()
         self._clock = clock
         self.fresh_within_seconds = fresh_within_seconds
@@ -47,11 +54,22 @@ class ObservabilityService:
         return self._store.ingest_event(event, retry_policy=self.retry_policy)
 
     def status(self, run_id: str):
-        """获取单个实例的一致汇总快照。"""
+        """获取单个实例的一致汇总快照。
+
+        已按保留策略淘汰或从未见过均返回 None；需要区分二者请用 lookup_run()。
+        """
         return self._store.get_status(run_id)
 
+    def lookup_run(self, run_id: str) -> RunLookup:
+        """单运行三态查询：PRESENT（含完整快照）/ EVICTED（已淘汰）/ UNKNOWN（未见）。"""
+        return self._store.lookup_run(run_id)
+
+    def retention_info(self) -> RetentionInfo:
+        """披露保留口径（上限）、当前保留数与累计淘汰量。"""
+        return self._store.retention_info()
+
     def all_status(self):
-        """获取全部实例的一致快照列表。"""
+        """获取全部（保留中的）实例的一致快照列表；已淘汰运行不出现。"""
         return self._store.list_status()
 
     # —— 管道级健康汇总 ——
@@ -60,9 +78,10 @@ class ObservabilityService:
         """获取管道级健康汇总快照；未知管道返回 None。
 
         口径见 docs/design.md：最近运行状态、最近成功时间、最近成功之后的
-        连续失败运行数、当前活动告警（失败/失新鲜分列、可并存）及判定依据。
+        连续失败运行数、当前活动告警（失败/失新鲜分列、可并存）及判定依据、
+        最近一次失败的错误分类/信息/终止原因，以及保留口径与该管道累计淘汰量。
         """
-        return self._store.pipelines.health(pipeline_id)
+        return self._store.health_snapshot(pipeline_id)
 
     def list_pipeline_ids(self) -> list[str]:
         """列出全部已登记管道 ID。"""
@@ -71,6 +90,14 @@ class ObservabilityService:
     def active_alerts(self, pipeline_id: str, *, kind: str | None = None):
         """惰性展开管道当前活动告警明细（FAILURE / STALENESS，可并存）。"""
         return self._store.pipelines.active_alerts(pipeline_id, kind=kind)
+
+    def active_alert_run_ids(self, pipeline_id: str) -> tuple[str, ...]:
+        """原子读取当前有活动告警的运行 ID（保证不含已淘汰运行）。"""
+        return self._store.active_alert_run_ids(pipeline_id)
+
+    def consistency_snapshot(self, pipeline_id: str) -> dict[str, object] | None:
+        """同一临界区内读出的并发自洽校验快照（见 store 文档）。"""
+        return self._store.consistency_snapshot(pipeline_id)
 
     # —— 失新鲜巡检（确定性触发，不依赖真实 sleep）——
 
@@ -159,6 +186,12 @@ class ObservabilityService:
         )
         snap = self._store.get_status(run_id)
         if snap is None:
+            lookup = self._store.lookup_run(run_id)
+            if lookup.status is LookupStatus.EVICTED:
+                return True, (
+                    f"实例 {run_id} 已按历史保留策略淘汰，不再提供失新鲜明细"
+                    "（结论：EVICTED，见 lookup_run）"
+                )
             return True, f"实例 {run_id} 不存在，无法确认最近成功时间，判定失新鲜"
         return staleness(
             last_success_at=snap.last_success_at,

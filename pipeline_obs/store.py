@@ -10,29 +10,43 @@
 
 from __future__ import annotations
 
+import heapq
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
-from .alerting import evaluate_alert, evaluate_staleness
+from .alerting import (
+    build_success_recovery_verdict,
+    evaluate_alert,
+    evaluate_staleness,
+)
 from .models import (
     ActiveAlertView,
     AlertKind,
     AlertState,
     ErrorClass,
     EventType,
+    FailureTerminalReason,
     IngestStatus,
+    LookupStatus,
     PipelineEvent,
+    PipelineHealth,
     PipelineState,
     PipelineStatus,
     RejectReason,
+    RetentionInfo,
     RetryDecision,
     RetryPolicy,
+    RunLookup,
     StalenessAlertState,
     StalenessVerdict,
 )
 from .pipeline import PipelineRegistry
 from .retry import decide_retry
+
+# 内存态历史保留的默认上限：最多保留最近的不同运行实例数。
+# 超过后按“最近事件时间最旧（同时间按 run_id 字典序）”淘汰。
+DEFAULT_MAX_RUNS = 1000
 
 
 @dataclass
@@ -54,6 +68,7 @@ class _RunRecord:
     retry_exhausted: bool = False
     last_error_class: ErrorClass | None = None
     last_error_message: str | None = None
+    last_failure_at: float | None = None
     alert: AlertState = field(default_factory=AlertState)
     # 归属管道（缺省为运行实例自身，保证旧调用方式口径不变）
     pipeline_id: str | None = None
@@ -130,29 +145,157 @@ class IngestResult:
 
 
 class PipelineStore:
-    """内存态、线程安全的管道运行观测存储。"""
+    """内存态、线程安全的管道运行观测存储。
 
-    def __init__(self, *, pipelines: PipelineRegistry | None = None) -> None:
+    历史保留：最多保留 ``max_runs`` 个不同运行（默认 DEFAULT_MAX_RUNS），
+    超过后在每次写入后淘汰“最近事件时间最旧（同时间按 run_id 字典序）”的运行；
+    ``max_runs=None`` 表示不设上限（与旧行为一致）。淘汰的运行从聚合中摘除、
+    不再进入任何汇总，其 run_id 在有界墓碑集合中保留，使后续查询得到一致的
+    “已淘汰”结论而不是报错或残缺数据；墓碑本身也按同一上限有界，内存不无限增长。
+    """
+
+    def __init__(
+        self,
+        *,
+        pipelines: PipelineRegistry | None = None,
+        max_runs: int | None = DEFAULT_MAX_RUNS,
+    ) -> None:
+        if max_runs is not None and max_runs <= 0:
+            raise ValueError("max_runs 必须为正整数或 None（不设上限）")
         self._records: dict[str, _RunRecord] = {}
         self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self._registry_lock = threading.Lock()
         # 管道级聚合注册表：默认自建（独立使用 store 时也能按“每实例一管道”查询）
         self._pipelines = pipelines if pipelines is not None else PipelineRegistry()
+        # —— 历史保留与淘汰 ——
+        self._max_runs = max_runs
+        self._evicted_total = 0
+        # 有界墓碑：记录已淘汰的 run_id，容量与保留上限同阶（None 时给一个保护上限）
+        self._tombstones: deque[str] = deque()
+        self._tombstone_set: set[str] = set()
+        # (latest_event_at, run_id) 最小堆：惰性校验（堆顶时间与记录实际时间不符即丢弃），
+        # 每个 run 每次写入入堆一次、出堆至多一次，写入摊还 O(log n)。
+        self._order_heap: list[tuple[float, str]] = []
 
     @property
     def pipelines(self) -> PipelineRegistry:
         return self._pipelines
 
-    def _get_or_create(self, run_id: str) -> _RunRecord:
+    @property
+    def max_runs(self) -> int | None:
+        return self._max_runs
+
+    def retention_info(self) -> RetentionInfo:
+        """对外披露保留口径、当前保留数与累计淘汰量。"""
+        with self._registry_lock:
+            return RetentionInfo(
+                max_runs=self._max_runs,
+                current_runs=len(self._records),
+                total_evicted_runs=self._evicted_total,
+            )
+
+    def retention_counts(self) -> tuple[int, int, int | None]:
+        """在注册锁内一次性读出 (当前保留数, 累计淘汰数, 上限)。"""
+        with self._registry_lock:
+            return len(self._records), self._evicted_total, self._max_runs
+
+    def consistency_snapshot(self, pipeline_id: str) -> dict[str, object] | None:
+        """在注册锁+管道锁同一临界区内读出并发自洽校验所需的全部字段。
+
+        淘汰在同一锁序下原子提交（墓碑登记与告警/聚合摘除不可分），因此本快照
+        内：活动告警引用的每个运行都必然仍在 _records 中（非墓碑、非缺失）。
+        """
+        agg = self._pipelines._ref(pipeline_id)
+        if agg is None:
+            return None
+        with self._registry_lock:
+            current_runs = len(self._records)
+            total_evicted = self._evicted_total
+            with agg.lock:
+                failure_ids = tuple(agg.failure_alerts.keys())
+                staleness_ids = tuple(agg.staleness_alerts.keys())
+                alert_ids = failure_ids + staleness_ids
+                referenced_kept = all(rid in self._records for rid in alert_ids)
+                return {
+                    "run_count": len(agg.run_ids),
+                    "consecutive_failures": agg.consecutive_failures,
+                    "failure_alert_count": len(agg.failure_alerts),
+                    "staleness_alert_count": len(agg.staleness_alerts),
+                    "pipeline_evicted": agg.evicted_run_count,
+                    "current_runs": current_runs,
+                    "total_evicted": total_evicted,
+                    "alert_run_ids": alert_ids,
+                    "alerts_reference_kept_runs": referenced_kept,
+                }
+
+    def active_alert_run_ids(self, pipeline_id: str) -> tuple[str, ...]:
+        """原子读取“当前有活动告警的运行”，并保证它们都仍在保留窗口内。
+
+        锁序与淘汰路径一致（注册锁 → 管道锁）：淘汰在同一临界区同时登记墓碑与
+        摘除告警，因此本方法不可能返回已淘汰（墓碑）运行的 ID。供并发自洽校验
+        与一致性测试使用；常规明细仍用 pipelines.active_alerts()。
+        """
+        agg = self._pipelines._ref(pipeline_id)
+        if agg is None:
+            return ()
+        with self._registry_lock, agg.lock:
+            ids: list[str] = []
+            ids.extend(agg.failure_alerts.keys())
+            ids.extend(agg.staleness_alerts.keys())
+            # 注册锁保护期间不会有淘汰发生，故所有 id 必仍在 _records 中。
+            return tuple(rid for rid in ids if rid in self._records)
+
+    def health_snapshot(self, pipeline_id: str) -> PipelineHealth | None:
+        """构造管道健康快照，并保证携带的保留口径与快照主体同一时刻、彼此自洽。
+
+        加锁顺序为「存储注册锁 → 管道聚合锁」；与淘汰路径「实例锁 → 注册锁 →
+        管道锁」方向一致，不构成等待环。两锁同时持有期间不会发生淘汰，
+        因此 run_count / current_runs / 累计淘汰量取自同一临界区。
+        """
+        agg = self._pipelines._ref(pipeline_id)
+        if agg is None:
+            return None
+        with self._registry_lock:
+            current_runs = len(self._records)
+            total_evicted = self._evicted_total
+            retention = RetentionInfo(
+                max_runs=self._max_runs,
+                current_runs=current_runs,
+                total_evicted_runs=total_evicted,
+            )
+            with agg.lock:
+                return self._pipelines.health_from_aggregate(agg, retention=retention)
+
+    def _add_tombstone_locked(self, run_id: str) -> None:
+        """在注册锁内登记一个已淘汰 run_id（墓碑有界，挤出最旧墓碑）。"""
+        if run_id in self._tombstone_set:
+            return
+        bound = self._max_runs if self._max_runs is not None else DEFAULT_MAX_RUNS
+        self._tombstones.append(run_id)
+        self._tombstone_set.add(run_id)
+        while len(self._tombstones) > bound:
+            dropped = self._tombstones.popleft()
+            self._tombstone_set.discard(dropped)
+
+    def is_evicted(self, run_id: str) -> bool:
+        with self._registry_lock:
+            return run_id in self._tombstone_set
+
+    def _get_or_create(self, run_id: str) -> _RunRecord | None:
         # 字典赋值在 CPython 下原子，但显式加注册锁使语义清晰且可移植。
         record = self._records.get(run_id)
-        if record is None:
-            with self._registry_lock:
-                record = self._records.get(run_id)
-                if record is None:
-                    record = _RunRecord(pipeline_run_id=run_id)
-                    self._records[run_id] = record
-        return record
+        if record is not None:
+            return record
+        with self._registry_lock:
+            record = self._records.get(run_id)
+            if record is not None:
+                return record
+            # 已淘汰的运行不得借新事件“复活”。
+            if run_id in self._tombstone_set:
+                return None
+            record = _RunRecord(pipeline_run_id=run_id)
+            self._records[run_id] = record
+            return record
 
     def _snapshot(self, rec: _RunRecord) -> PipelineStatus:
         kinds: list[str] = []
@@ -160,6 +303,22 @@ class PipelineStore:
             kinds.append("FAILURE")
         if rec.staleness.active:
             kinds.append("STALENESS")
+        # 失败终止原因（两类可区分）；非失败终止态为 None
+        terminal_reason: str | None = None
+        if rec.state is PipelineState.FAILED_FATAL:
+            terminal_reason = FailureTerminalReason.NON_RETRYABLE.value
+        elif rec.state is PipelineState.FAILED_RETRYABLE and rec.retry_exhausted:
+            terminal_reason = FailureTerminalReason.RETRY_EXHAUSTED.value
+        # 失新鲜判定依据必须与活动标志同一版：
+        # 活动中展示最近一次（失新鲜）巡检依据；已恢复展示最近一次恢复/新鲜依据。
+        if rec.staleness.active:
+            staleness_reason = (
+                rec.staleness.last_verdict.reason
+                if rec.staleness.last_verdict is not None
+                else None
+            )
+        else:
+            staleness_reason = rec.staleness.last_recovery_reason
         return PipelineStatus(
             pipeline_run_id=rec.pipeline_run_id,
             state=rec.state,
@@ -175,13 +334,19 @@ class PipelineStore:
             alert_reason=rec.alert.reason,
             pipeline_id=rec.pipeline_id,
             staleness_alert_active=rec.staleness.active,
-            staleness_alert_reason=(
-                rec.staleness.last_verdict.reason
-                if rec.staleness.last_verdict is not None
-                else None
-            ),
+            staleness_alert_reason=staleness_reason,
             staleness_raised_count=rec.staleness.raised_count,
             active_alert_kinds=tuple(kinds),
+            last_error_class=(
+                rec.last_error_class.value
+                if rec.last_error_class is not None
+                else None
+            ),
+            last_error_message=rec.last_error_message,
+            failure_terminal_reason=terminal_reason,
+            last_failure_at=rec.last_failure_at,
+            staleness_recovered_at=rec.staleness.last_recovered_at,
+            staleness_recovery_reason=rec.staleness.last_recovery_reason,
         )
 
     def ingest_event(
@@ -203,7 +368,32 @@ class PipelineStore:
            保证查询方不会观察到“已失败但尚无重试调度”的中间态。
         """
         rec = self._get_or_create(event.pipeline_run_id)
+        if rec is None:
+            # 该运行已被保留策略淘汰：不再接收其事件，结论与查询口径保持一致。
+            return IngestResult(
+                IngestStatus.REJECTED,
+                state=PipelineState.PENDING,
+                reason=RejectReason.RUN_EVICTED,
+                detail=(
+                    f"运行 {event.pipeline_run_id} 已按历史保留策略淘汰，"
+                    "不再接收事件（如需继续观测请使用新的运行实例 ID）"
+                ),
+            )
         with self._locks[event.pipeline_run_id]:
+            # 双检：拿到实例锁后再确认一次，挡住“检查后、加锁前”被淘汰的竞态。
+            with self._registry_lock:
+                evicted_now = event.pipeline_run_id in self._tombstone_set
+                still_kept = event.pipeline_run_id in self._records
+            if evicted_now or not still_kept:
+                return IngestResult(
+                    IngestStatus.REJECTED,
+                    state=PipelineState.PENDING,
+                    reason=RejectReason.RUN_EVICTED,
+                    detail=(
+                        f"运行 {event.pipeline_run_id} 已按历史保留策略淘汰，"
+                        "不再接收事件（如需继续观测请使用新的运行实例 ID）"
+                    ),
+                )
             # 管道归属绑定：未显式指定 pipeline_id 时，默认该实例自成一管道，
             # 与旧口径完全一致；显式指定后不得跨管道漂移。
             requested_pipeline = event.pipeline_id or event.pipeline_run_id
@@ -298,6 +488,8 @@ class PipelineStore:
 
             # 6. 应用事件
             retry_decision = self._apply(rec, event, target, retry_policy=retry_policy)
+            # 7. 保留淘汰：超出上限后淘汰最旧运行（当前运行仍持锁，不会被选为牺牲品）。
+            self._enforce_retention(current_run_id=event.pipeline_run_id)
             return IngestResult(
                 IngestStatus.APPLIED,
                 state=rec.state,
@@ -330,6 +522,8 @@ class PipelineStore:
         rec.seen_event_ids.add(event.event_id)
         rec.applied_version = event.version
         rec.latest_event_at = event.occurred_at
+        # 记录顺序堆（保留淘汰用）：每次应用都入堆一项，旧项在淘汰时惰性校验丢弃。
+        heapq.heappush(self._order_heap, (event.occurred_at, event.pipeline_run_id))
 
         if event.event_type is EventType.STARTED:
             if rec.started_at is None:
@@ -350,8 +544,10 @@ class PipelineStore:
             rec.last_success_at = event.occurred_at
             rec.next_retry_at = None
             rec.retry_exhausted = False
+            # 恢复成功后不得残留上一次失败的旧错误：错误分类/信息/失败时间一并清空。
             rec.last_error_class = None
             rec.last_error_message = None
+            rec.last_failure_at = None
             was_active = rec.alert.active
             evaluate_alert(
                 rec.alert,
@@ -360,7 +556,8 @@ class PipelineStore:
                 version=event.version,
             )
             self._raise_at_if_new(rec.alert, was_active, event.occurred_at)
-            # 成功即恢复新鲜：关闭可能活动的失新鲜告警（同事件时间轴，立即判定）。
+            # 成功即恢复新鲜：关闭可能活动的失新鲜告警（同事件时间轴，立即判定），
+            # 并把判定依据刷新为同版的“恢复/新鲜”结论（带恢复时刻与依据）。
             self._recover_staleness_on_success(rec, at=event.occurred_at)
             self._pipelines.note_success(
                 rec.pipeline_id, rec.pipeline_run_id,
@@ -374,6 +571,7 @@ class PipelineStore:
         rec.failure_count += 1
         rec.last_error_class = event.error_class
         rec.last_error_message = event.error_message
+        rec.last_failure_at = event.occurred_at
         if target is PipelineState.FAILED_FATAL:
             rec.state = PipelineState.FAILED_FATAL
             rec.next_retry_at = None
@@ -384,6 +582,8 @@ class PipelineStore:
                 state=rec.state,
                 retry_exhausted=True,
                 version=event.version,
+                error_class=event.error_class,
+                error_message=event.error_message,
             )
             self._raise_at_if_new(rec.alert, was_active, event.occurred_at)
             self._note_failure_aggregate(rec, event, target)
@@ -416,6 +616,8 @@ class PipelineStore:
             state=rec.state,
             retry_exhausted=rec.retry_exhausted,
             version=event.version,
+            error_class=event.error_class,
+            error_message=event.error_message,
         )
         self._raise_at_if_new(rec.alert, was_active, base_now)
         self._note_failure_aggregate(rec, event, target)
@@ -435,7 +637,14 @@ class PipelineStore:
         event: PipelineEvent,
         target: PipelineState,
     ) -> None:
-        """在同一临界区把失败终态同步进管道聚合（含失败告警镜像）。"""
+        """在同一临界区把失败终态同步进管道聚合（含失败告警镜像与失败原因）。"""
+        terminal: FailureTerminalReason | None
+        if target is PipelineState.FAILED_FATAL:
+            terminal = FailureTerminalReason.NON_RETRYABLE
+        elif rec.retry_exhausted:
+            terminal = FailureTerminalReason.RETRY_EXHAUSTED
+        else:
+            terminal = None
         self._pipelines.note_failure(
             rec.pipeline_id,
             rec.pipeline_run_id,
@@ -445,16 +654,103 @@ class PipelineStore:
             alert_reason=rec.alert.reason,
             raised_at=rec.alert.last_raised_at,
             version=event.version,
+            error_class=(
+                event.error_class.value if event.error_class is not None else None
+            ),
+            error_message=event.error_message,
+            terminal_reason=terminal.value if terminal is not None else None,
+            failure_at=event.occurred_at,
         )
 
     def _recover_staleness_on_success(
         self, rec: _RunRecord, *, at: float
     ) -> None:
-        """成功事件即时恢复失新鲜：关闭活动告警并记录恢复时刻（不依赖巡检）。"""
-        if rec.staleness.active:
-            rec.staleness.active = False
-            rec.staleness.raised_at = None
-            rec.staleness.last_recovered_at = at
+        """成功事件即时恢复失新鲜：关闭活动告警，恢复时刻与判定依据一起更新。
+
+        不依赖下轮巡检：在成功写入的同一临界区内完成。恢复依据通过
+        build_success_recovery_verdict 构造（基线=本次成功、age=0、在窗口内），
+        与活动标志保持同一版结论，避免“告警已关但依据仍是失新鲜”的矛盾快照。
+        """
+        st = rec.staleness
+        recovery = build_success_recovery_verdict(st, success_at=at)
+        if st.active:
+            st.active = False
+            st.raised_at = None
+        st.last_recovered_at = at
+        st.last_checked_at = at
+        if recovery is not None:
+            st.last_verdict = recovery
+            st.last_recovery_reason = recovery.reason
+        # 同步撤销管道侧的失新鲜告警镜像（阈值沿用最近一次巡检口径，未巡检则不覆盖）。
+        self._pipelines.set_staleness_alert(
+            rec.pipeline_id,
+            rec.pipeline_run_id,
+            view=None,
+            threshold_seconds=st.last_threshold_seconds,
+            checked_at=at,
+        )
+
+    # —— 历史保留与淘汰 ——
+
+    def _enforce_retention(self, *, current_run_id: str) -> None:
+        """超过保留上限时淘汰最旧运行。调用方已持有 current_run_id 的实例锁。
+
+        淘汰规则：最近事件时间最旧；同时间按 run_id 字典序。
+        使用惰性校验最小堆选择牺牲品。死锁规避：堆顶只在“失效”（记录已不在、
+        或该运行已更新到更晚时间）时弹出；若堆顶是一条有效项但恰好属于当前
+        运行（当前运行即全局最旧），本轮**不淘汰也不弹出**直接返回——否则两个
+        并发写入者会互相把对方选为牺牲品形成 AB-BA。该堆项保留，等下一个别的
+        运行写入时重新评估（容量至多瞬时超限 1 个并很快自愈）。
+        """
+        if self._max_runs is None:
+            return
+        while True:
+            with self._registry_lock:
+                if len(self._records) <= self._max_runs:
+                    return
+                victim_id: str | None = None
+                victim_at: float | None = None
+                while self._order_heap:
+                    at, rid = self._order_heap[0]
+                    rec = self._records.get(rid)
+                    if rec is None or rec.latest_event_at != at:
+                        heapq.heappop(self._order_heap)  # 失效项：丢弃
+                        continue
+                    if rid == current_run_id:
+                        # 当前运行的有效最旧项：不淘汰自己、不弹出，本轮结束。
+                        return
+                    victim_id = rid
+                    victim_at = at
+                    break
+                if victim_id is None:
+                    return  # 堆被失效项耗尽，等待后续写入重建
+            self._evict_run(victim_id, at=victim_at)
+
+    def _evict_run(self, run_id: str, *, at: float | None) -> None:
+        """按固定加锁顺序（实例锁 → 注册锁 → 管道锁）摘除一个被淘汰的运行。
+
+        记录摘除与聚合摘除在同一注册锁临界区内完成，查询者不会看到“记录已消失
+        但仍计入管道汇总”的中间态。管道锁永远在链路最后获取，正常写入路径为
+        实例锁 → 管道锁，两者方向一致，不构成等待环。
+        """
+        victim_lock = self._locks[run_id]
+        with victim_lock, self._registry_lock:
+            rec = self._records.pop(run_id, None)
+            if rec is None:
+                return  # 已被其他线程淘汰
+            self._evicted_total += 1
+            self._add_tombstone_locked(run_id)
+            pipeline_id = rec.pipeline_id
+            state = rec.state
+            last_failure_at = rec.last_failure_at
+            # 仍在注册锁内完成聚合摘除（管道锁为链路最后一环，见上）。
+            self._pipelines.evict_run(
+                pipeline_id,
+                run_id,
+                state=state,
+                failed_at=last_failure_at,
+            )
+            self._locks.pop(run_id, None)
 
     def check_staleness(
         self,
@@ -499,12 +795,46 @@ class PipelineStore:
             return verdict
 
     def get_status(self, run_id: str) -> PipelineStatus | None:
-        """读取一致的状态汇总快照；不存在返回 None。"""
+        """读取一致的状态汇总快照；从未见过或已淘汰均返回 None。
+
+        需要区分“已淘汰”与“从未见过”时请用 :meth:`lookup_run`。
+        """
         rec = self._records.get(run_id)
         if rec is None:
             return None
         with self._locks[run_id]:
             return self._snapshot(rec)
+
+    def lookup_run(self, run_id: str) -> RunLookup:
+        """单运行三态查询：PRESENT / EVICTED / UNKNOWN，结论明确一致、不报错。
+
+        - PRESENT：运行在保留窗口内，snapshot 为锁内构造的完整快照；
+        - EVICTED：运行曾被观测但已按保留策略淘汰，不返回残缺数据，附说明；
+        - UNKNOWN：从未观测到该运行。
+        """
+        rec = self._records.get(run_id)
+        if rec is not None:
+            with self._locks[run_id]:
+                return RunLookup(
+                    status=LookupStatus.PRESENT,
+                    snapshot=self._snapshot(rec),
+                )
+        with self._registry_lock:
+            if run_id in self._tombstone_set:
+                return RunLookup(
+                    status=LookupStatus.EVICTED,
+                    run_id=run_id,
+                    detail=(
+                        f"运行 {run_id} 曾被观测，但已按历史保留策略淘汰"
+                        f"（上限 max_runs={self._max_runs}）；其不再进入任何汇总，"
+                        "也不返回残缺明细。累计淘汰量见 retention_info()。"
+                    ),
+                )
+        return RunLookup(
+            status=LookupStatus.UNKNOWN,
+            run_id=run_id,
+            detail=f"从未观测到运行 {run_id}",
+        )
 
     def list_status(self) -> list[PipelineStatus]:
         """列出全部实例的汇总快照（逐个加锁，单实例快照无中间态）。"""

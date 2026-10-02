@@ -250,10 +250,20 @@ def test_pipeline_summary_exact_across_many_runs_with_watermark():
 
 
 def test_pipeline_health_query_cost_does_not_grow_with_history():
-    """历史实例线性增长时，管道健康查询耗时基本恒定（物化聚合，非全量扫描）。"""
+    """历史实例线性增长时，管道健康查询耗时基本恒定（物化聚合，非全量扫描）。
+
+    本用例显式选择“不设上限（max_runs=None）”以在同一服务内累积 5000 个运行；
+    有界保留 + 淘汰的口径见 test_retention.py。
+    """
     import time as _time
 
-    svc, _t = _svc()
+    t = {"v": 100.0}
+    svc = ObservabilityService(
+        retry_policy=RetryPolicy(max_attempts=3, base_delay_seconds=1.0),
+        clock=lambda: t["v"],
+        fresh_within_seconds=3.0,
+        max_runs=None,
+    )
     pid = "pipe-scale"
 
     def seed(n, offset=0):

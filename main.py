@@ -12,6 +12,7 @@ from pipeline_obs import (
     ErrorClass,
     EventType,
     IngestStatus,
+    LookupStatus,
     ObservabilityService,
     PipelineEvent,
 )
@@ -73,7 +74,16 @@ def post_event(payload: EventIn):
 
 @app.get("/runs/{run_id}")
 def get_run(run_id: str):
-    snap = service.status(run_id)
+    # 三态查询：在窗口内返回完整快照；已淘汰返回 410 Gone（结论明确、不报错、不残缺）；
+    # 从未见过返回 404。旧调用方仍可据 200/404 使用；410 是新增强口径。
+    lookup = service.lookup_run(run_id)
+    if lookup.status is LookupStatus.EVICTED:
+        return JSONResponse(
+            {"detail": "run evicted by retention policy", "reason": "RUN_EVICTED",
+             "message": lookup.detail},
+            status_code=410,
+        )
+    snap = lookup.snapshot
     if snap is None:
         return JSONResponse({"detail": "run not found"}, status_code=404)
     # 旧字段全部保留，仅在末尾追加新字段（向后兼容）
@@ -96,6 +106,14 @@ def get_run(run_id: str):
         "staleness_alert_active": snap.staleness_alert_active,
         "staleness_alert_reason": snap.staleness_alert_reason,
         "staleness_raised_count": snap.staleness_raised_count,
+        # —— 新增：最近一次失败原因（从未失败/已恢复成功后为 null）——
+        "last_error_class": snap.last_error_class,
+        "last_error_message": snap.last_error_message,
+        "failure_terminal_reason": snap.failure_terminal_reason,
+        "last_failure_at": snap.last_failure_at,
+        # —— 新增：失新鲜恢复时刻与同版恢复/新鲜依据 ——
+        "staleness_recovered_at": snap.staleness_recovered_at,
+        "staleness_recovery_reason": snap.staleness_recovery_reason,
     }
 
 
@@ -132,6 +150,23 @@ def get_pipeline_health(pipeline_id: str):
         "has_staleness_alert": h.has_staleness_alert,
         "staleness_threshold_seconds": h.staleness_threshold_seconds,
         "checked_at": h.checked_at,
+        # —— 新增：管道最近一次失败原因（从未失败/全部恢复后为 null）——
+        "latest_failure_run_id": h.latest_failure_run_id,
+        "latest_failure_at": h.latest_failure_at,
+        "latest_error_class": h.latest_error_class,
+        "latest_error_message": h.latest_error_message,
+        "latest_failure_terminal_reason": h.latest_failure_terminal_reason,
+        # —— 新增：保留口径与该管道累计淘汰量 ——
+        "evicted_run_count": h.evicted_run_count,
+        "retention": (
+            None
+            if h.retention is None
+            else {
+                "max_runs": h.retention.max_runs,
+                "current_runs": h.retention.current_runs,
+                "total_evicted_runs": h.retention.total_evicted_runs,
+            }
+        ),
         "active_alerts": [
             {
                 "pipeline_run_id": a.pipeline_run_id,
@@ -139,9 +174,25 @@ def get_pipeline_health(pipeline_id: str):
                 "reason": a.reason,
                 "since": a.since,
                 "version": a.version,
+                # 失败告警附带最近一次失败原因（失新鲜告警恒为 null）
+                "error_class": a.error_class,
+                "error_message": a.error_message,
+                "failure_terminal_reason": a.failure_terminal_reason,
+                "last_failure_at": a.last_failure_at,
             }
             for a in service.active_alerts(pipeline_id)
         ],
+    }
+
+
+@app.get("/retention")
+def get_retention():
+    """对外披露历史保留口径、当前保留数与累计淘汰量。"""
+    info = service.retention_info()
+    return {
+        "max_runs": info.max_runs,
+        "current_runs": info.current_runs,
+        "total_evicted_runs": info.total_evicted_runs,
     }
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from .models import (
     AlertState,
+    ErrorClass,
+    FailureTerminalReason,
     PipelineState,
     StalenessAlertState,
     StalenessBaseline,
@@ -15,28 +17,61 @@ _FAIL_STATES = frozenset(
 )
 
 
+def _failure_phrase(
+    state: PipelineState,
+    retry_exhausted: bool,
+    error_class: ErrorClass | None,
+    error_message: str | None,
+) -> tuple[str, FailureTerminalReason | None]:
+    """构造失败态描述，并给出可区分的终止原因（仍在重试中则为 None）。
+
+    关键区分：错误本身不可重试（FATAL，一次即终态）与
+    可重试错误已用尽机会（RETRYABLE + retry_exhausted）是两回事，
+    不能把 FATAL 写成“重试已耗尽”，以免误导处置。
+    """
+    message = f"，错误信息={error_message}" if error_message else ""
+    if state is PipelineState.FAILED_FATAL:
+        ec = (error_class or ErrorClass.FATAL).value
+        phrase = (
+            f"错误分类={ec}，错误本身不可重试（NON_RETRYABLE），立即终止{message}"
+        )
+        return phrase, FailureTerminalReason.NON_RETRYABLE
+    # FAILED_RETRYABLE
+    ec = (error_class or ErrorClass.RETRYABLE).value
+    if retry_exhausted:
+        phrase = (
+            f"错误分类={ec}，可重试错误已用尽重试机会（RETRY_EXHAUSTED）{message}"
+        )
+        return phrase, FailureTerminalReason.RETRY_EXHAUSTED
+    phrase = f"错误分类={ec}，等待/进行重试{message}"
+    return phrase, None
+
+
 def evaluate_alert(
     alert: AlertState,
     *,
     state: PipelineState,
     retry_exhausted: bool,
     version: int,
+    error_class: ErrorClass | None = None,
+    error_message: str | None = None,
 ) -> AlertState:
     """根据最新状态评估告警，原地更新并返回告警状态。
 
     规则（同一异常恢复前不重复产生告警）：
     - 进入失败态（FAILED_RETRYABLE / FAILED_FATAL）且当前无活动告警：
-      触发一次告警并计数；失败原因中体现是否已重试耗尽。
+      触发一次告警并计数；失败依据中体现错误分类/错误信息，并区分
+      “错误本身不可重试（NON_RETRYABLE）”与“可重试错误已用尽机会
+      （RETRY_EXHAUSTED）”两种终止原因。
     - 已存在活动告警且仍在失败态：收敛，不重复计数，仅刷新依据描述。
     - 恢复到 SUCCEEDED：关闭活动告警，之后再次失败才算新异常。
     - PENDING / RUNNING：不改变告警（运行中的实例不产生失败告警）。
     """
     if state in _FAIL_STATES:
-        reason = (
-            f"管道进入 {state.value}（version={version}，"
-            + ("重试已耗尽" if retry_exhausted else "等待/进行重试")
-            + "）"
+        phrase, _terminal = _failure_phrase(
+            state, retry_exhausted, error_class, error_message
         )
+        reason = f"管道进入 {state.value}（version={version}，{phrase}）"
         if not alert.active:
             alert.active = True
             alert.raised_count += 1
@@ -84,6 +119,15 @@ def evaluate_staleness(
     if fresh_within_seconds <= 0:
         raise ValueError("fresh_within_seconds 必须为正数")
 
+    # 时间契约：巡检时刻必须单调不减。拿更早的旧时刻重判一个已经推进到更晚
+    # 基线的实例，可能把已被更新成功覆盖的实例重新判成失新鲜（旧结论回潮），
+    # 因此明确拒绝乱序巡检；需要重放历史请使用独立的服务实例。
+    if state.last_checked_at is not None and now < state.last_checked_at:
+        raise ValueError(
+            f"巡检时刻 now={now} 早于上次巡检时刻 {state.last_checked_at}，"
+            "拒绝乱序巡检（时刻必须单调不减）"
+        )
+
     if last_success_at is not None:
         age = now - last_success_at
         stale = age > fresh_within_seconds
@@ -129,6 +173,7 @@ def evaluate_staleness(
 
     state.last_checked_at = now
     state.last_verdict = verdict
+    state.last_threshold_seconds = fresh_within_seconds
 
     if verdict.stale:
         if not state.active:
@@ -140,11 +185,63 @@ def evaluate_staleness(
         # 持续失新鲜：收敛，不重复计数（依据已随 last_verdict 刷新）
     else:
         if state.active:
-            # 失新鲜 → 恢复新鲜：关闭本段
+            # 失新鲜 → 恢复新鲜：关闭本段，并把判定依据刷新为同版的“新鲜”结论。
+            # 活动标志与判定依据必须在同一临界区一起更新，杜绝“告警已关、
+            # 依据仍停留在失新鲜那一版”的自相矛盾快照。
             state.active = False
             state.raised_at = None
             state.last_recovered_at = now
+        # 无论本段是否刚恢复：当前为新鲜，依据与活动标志保持同一版结论，
+        # 旧的失新鲜依据不允许回潮。
+        state.last_recovery_reason = verdict.reason
+        state.last_verdict = verdict
 
+    return verdict
+
+
+def build_success_recovery_verdict(
+    state: StalenessAlertState,
+    *,
+    success_at: float,
+) -> StalenessVerdict | None:
+    """成功事件即时恢复失新鲜时，构造与恢复结论同版的新鲜判定依据。
+
+    成功在写入临界区内立即把基线刷新为 last_success_at=success_at，
+    因此此刻 age=0、必然落在新鲜窗口内（沿用最近一次巡检阈值；从未巡检过
+    则无法给出阈值口径，返回 None，调用方只关闭告警即可）。
+
+    与巡检恢复一样：活动标志关闭、恢复时刻与判定依据一起更新，
+    保证恢复后明细给出的是“恢复/新鲜”结论而非旧的失新鲜依据。
+    成功时刻早于上次巡检时刻属于乱序时间线（与事件 version 检查配套），拒绝。
+    """
+    if (
+        state.last_checked_at is not None
+        and success_at < state.last_checked_at
+    ):
+        raise ValueError(
+            f"成功事件时刻 {success_at} 早于上次巡检时刻 "
+            f"{state.last_checked_at}，拒绝乱序时间线"
+        )
+    threshold = state.last_threshold_seconds
+    if threshold is None:
+        # 从未巡检过：没有可复用的阈值口径，无需产出判定结论。
+        return None
+    age = 0.0
+    reason = (
+        f"成功即时恢复新鲜：基线=最近成功时间 LAST_SUCCESS"
+        f"(last_success_at={success_at:.3f})，恢复时刻={success_at:.3f}，"
+        f"距今 {age:.3f}s，阈值 {threshold:.3f}s，在新鲜窗口内；"
+        f"失新鲜告警已关闭（此前共 {state.raised_count} 段告警）"
+    )
+    verdict = StalenessVerdict(
+        stale=False,
+        baseline_kind=StalenessBaseline.LAST_SUCCESS,
+        baseline_at=success_at,
+        now=success_at,
+        threshold_seconds=threshold,
+        age_seconds=age,
+        reason=reason,
+    )
     return verdict
 
 
