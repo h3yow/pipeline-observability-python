@@ -25,9 +25,13 @@ def _svc():
 
 def _ev(run, eid, etype, version, attempt=1, ec=None, at=None):
     return PipelineEvent(
-        run, eid, etype,
+        run,
+        eid,
+        etype,
         occurred_at=float(at if at is not None else version),
-        version=version, attempt=attempt, error_class=ec,
+        version=version,
+        attempt=attempt,
+        error_class=ec,
     )
 
 

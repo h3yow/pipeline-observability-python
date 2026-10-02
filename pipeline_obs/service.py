@@ -9,18 +9,24 @@ from .alerting import staleness
 from .models import (
     PipelineEvent,
     PipelineHealth,
+    RetentionStatus,
     RetryPolicy,
+    RunLookup,
     StalenessVerdict,
 )
 from .store import IngestResult, PipelineStore
 
 
 class ObservabilityService:
-    """组合存储（状态机/去重/乱序/重试调度/告警收敛/管道聚合）与时效判定的应用服务。
+    """组合存储（状态机/去重/乱序/重试调度/告警收敛/管道聚合/历史保留）与时效判定的应用服务。
 
     fresh_within_seconds：失新鲜阈值（秒），全局默认值，可在构造时配置；
     单次巡检也可显式传入阈值覆盖。巡检时刻一律取自注入时钟 clock，
     因此测试可注入可控时钟、按需确定性触发，不依赖真实 sleep。
+
+    max_retained_runs：历史运行保留上限（不同运行实例数硬上限，默认 10000）。
+    超出后按最近事件时间淘汰最旧的运行；口径与累计淘汰量见 retention_status()。
+    仅在使用自建存储时生效；显式传入 store 时以该 store 的配置为准。
     """
 
     def __init__(
@@ -30,10 +36,11 @@ class ObservabilityService:
         store: PipelineStore | None = None,
         clock: Callable[[], float] = time.monotonic,
         fresh_within_seconds: float = 300.0,
+        max_retained_runs: int | None = None,
     ) -> None:
         if fresh_within_seconds <= 0:
             raise ValueError("fresh_within_seconds 必须为正数")
-        self._store = store or PipelineStore()
+        self._store = store or PipelineStore(max_retained_runs=max_retained_runs)
         self.retry_policy = retry_policy or RetryPolicy()
         self._clock = clock
         self.fresh_within_seconds = fresh_within_seconds
@@ -51,8 +58,30 @@ class ObservabilityService:
         return self._store.get_status(run_id)
 
     def all_status(self):
-        """获取全部实例的一致快照列表。"""
+        """获取全部实例的一致快照列表（仅保留窗口内运行，被淘汰者不出现）。"""
         return self._store.list_status()
+
+    def lookup_run(self, run_id: str) -> RunLookup:
+        """查询单个运行的一致结果。
+
+        - FOUND：status 为完整快照（与 status() 同源、同口径）；
+        - EVICTED：该运行曾被观测，但已超出历史保留上限被淘汰，
+          不再进入任何汇总；detail 给出明确口径，不抛错、不返回残缺数据；
+        - UNKNOWN：从未观测到该运行。
+        """
+        return self._store.lookup_run(run_id)
+
+    def retention_status(self) -> RetentionStatus:
+        """披露历史保留口径：保留上限、当前保留数、累计淘汰运行数。"""
+        return self._store.retention_status()
+
+    def retained_runs_view(self) -> tuple[RetentionStatus, tuple[str, ...]]:
+        """同一临界区内返回（保留口径, 当前保留运行 ID 集合），供强一致校验。
+
+        并发淘汰进行中两者也严格相等（取自同一把 registry_lock）；
+        区别于分别调用 retention_status() 与 all_status() 的两次独立读。
+        """
+        return self._store.retention_snapshot()
 
     # —— 管道级健康汇总 ——
 

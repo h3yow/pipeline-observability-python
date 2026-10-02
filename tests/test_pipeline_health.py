@@ -34,8 +34,14 @@ def _svc(threshold=3.0, max_attempts=3):
 
 def _ev(run, pid, eid, etype, version, at, *, attempt=1, ec=None):
     return PipelineEvent(
-        run, eid, etype, occurred_at=at, version=version, attempt=attempt,
-        error_class=ec, pipeline_id=pid,
+        run,
+        eid,
+        etype,
+        occurred_at=at,
+        version=version,
+        attempt=attempt,
+        error_class=ec,
+        pipeline_id=pid,
     )
 
 
@@ -54,9 +60,7 @@ def test_concurrent_reports_keep_pipeline_summary_consistent():
                 continue
             if h.consecutive_failures < 0 or h.consecutive_failures > h.run_count:
                 violations.append("bad consecutive_failures")
-            total_alerts = (
-                h.active_failure_alert_count + h.active_staleness_alert_count
-            )
+            total_alerts = h.active_failure_alert_count + h.active_staleness_alert_count
             if total_alerts > h.run_count * 2:
                 violations.append("active alerts exceed 2x runs")
             if h.has_staleness_alert and h.staleness_threshold_seconds is None:
@@ -65,7 +69,10 @@ def test_concurrent_reports_keep_pipeline_summary_consistent():
             if any(k not in ("FAILURE", "STALENESS") for k in kinds):
                 violations.append("unknown alert kind")
 
-    logger.info("==== 管道并发汇总：%d 个运行、每事件重复 4 次并发提交 + 8 持续读取者 ====", n_runs)
+    logger.info(
+        "==== 管道并发汇总：%d 个运行、每事件重复 4 次并发提交 + 8 持续读取者 ====",
+        n_runs,
+    )
     readers = [threading.Thread(target=reader) for _ in range(8)]
     for th in readers:
         th.start()
@@ -74,8 +81,17 @@ def test_concurrent_reports_keep_pipeline_summary_consistent():
     for i in range(1, n_runs + 1):
         run = f"run-{i:02d}"
         events.append(_ev(run, pid, f"r{i}-s", EventType.STARTED, 1, float(i)))
-        events.append(_ev(run, pid, f"r{i}-f", EventType.FAILED, 2,
-                          float(i) + 0.5, ec=ErrorClass.RETRYABLE))
+        events.append(
+            _ev(
+                run,
+                pid,
+                f"r{i}-f",
+                EventType.FAILED,
+                2,
+                float(i) + 0.5,
+                ec=ErrorClass.RETRYABLE,
+            )
+        )
 
     with ThreadPoolExecutor(max_workers=16) as pool:
         list(pool.map(lambda e: svc.ingest(e), events * 4))
@@ -89,7 +105,10 @@ def test_concurrent_reports_keep_pipeline_summary_consistent():
     log_health(h, alerts)
     logger.info(
         "[并发结论] runs=%d 连续失败=%d 活动告警=%d 读不变量违例=%d（预期 0）",
-        h.run_count, h.consecutive_failures, len(alerts), len(violations),
+        h.run_count,
+        h.consecutive_failures,
+        len(alerts),
+        len(violations),
     )
     assert violations == []
     assert h.run_count == n_runs
@@ -155,8 +174,11 @@ def test_failure_and_staleness_alerts_coexist_and_recover_independently():
 
     svc.ingest(_ev(run, pid, "e1", EventType.STARTED, 1, 100.0))
     t["v"] = 102.0
-    log_result(svc.ingest(_ev(run, pid, "e2", EventType.FAILED, 2, 102.0,
-                              ec=ErrorClass.RETRYABLE)))
+    log_result(
+        svc.ingest(
+            _ev(run, pid, "e2", EventType.FAILED, 2, 102.0, ec=ErrorClass.RETRYABLE)
+        )
+    )
     snap = svc.status(run)
     assert snap.alert_active and not snap.staleness_alert_active
     assert snap.active_alert_kinds == ("FAILURE",)
@@ -172,7 +194,8 @@ def test_failure_and_staleness_alerts_coexist_and_recover_independently():
     log_health(h, svc.active_alerts(pid))
     assert h.has_failure_alert and h.has_staleness_alert
     assert sorted(a.kind.value for a in svc.active_alerts(pid)) == [
-        "FAILURE", "STALENESS",
+        "FAILURE",
+        "STALENESS",
     ]
 
     # 成功同时恢复两类（RETRYABLE 允许重试后成功）
@@ -188,12 +211,25 @@ def test_failure_and_staleness_alerts_coexist_and_recover_independently():
     snap = svc.status(run)
     assert snap.staleness_alert_active and not snap.alert_active
     assert snap.active_alert_kinds == ("STALENESS",)
-    logger.info("[仅失新鲜] kinds=%s 依据=%s", snap.active_alert_kinds,
-                snap.staleness_alert_reason)
+    logger.info(
+        "[仅失新鲜] kinds=%s 依据=%s",
+        snap.active_alert_kinds,
+        snap.staleness_alert_reason,
+    )
 
     # 再失败：两类并存；同段失新鲜不因失败而重复计数
-    svc.ingest(_ev(run, pid, "e5", EventType.FAILED, 5, 111.5,
-                   attempt=3, ec=ErrorClass.RETRYABLE))
+    svc.ingest(
+        _ev(
+            run,
+            pid,
+            "e5",
+            EventType.FAILED,
+            5,
+            111.5,
+            attempt=3,
+            ec=ErrorClass.RETRYABLE,
+        )
+    )
     svc.check_staleness(run, now=112.0)
     snap = svc.status(run)
     assert snap.active_alert_kinds == ("FAILURE", "STALENESS")
@@ -228,11 +264,31 @@ def test_pipeline_summary_exact_across_many_runs_with_watermark():
 
     # 水位之后的新失败才计数；同一运行重试失败不重复计
     svc.ingest(_ev("r4", pid, "s", EventType.STARTED, 1, 4.0))
-    svc.ingest(_ev("r4", pid, "f1", EventType.FAILED, 2, 5.0, attempt=1,
-                   ec=ErrorClass.RETRYABLE))
+    svc.ingest(
+        _ev(
+            "r4",
+            pid,
+            "f1",
+            EventType.FAILED,
+            2,
+            5.0,
+            attempt=1,
+            ec=ErrorClass.RETRYABLE,
+        )
+    )
     svc.ingest(_ev("r4", pid, "s2", EventType.STARTED, 3, 5.5, attempt=2))
-    svc.ingest(_ev("r4", pid, "f2", EventType.FAILED, 4, 6.0, attempt=2,
-                   ec=ErrorClass.RETRYABLE))
+    svc.ingest(
+        _ev(
+            "r4",
+            pid,
+            "f2",
+            EventType.FAILED,
+            4,
+            6.0,
+            attempt=2,
+            ec=ErrorClass.RETRYABLE,
+        )
+    )
     svc.ingest(_ev("r5", pid, "s", EventType.STARTED, 1, 6.5))
     svc.ingest(_ev("r5", pid, "f", EventType.FAILED, 2, 7.0, ec=ErrorClass.FATAL))
     h = svc.pipeline_health(pid)
@@ -260,8 +316,17 @@ def test_pipeline_health_query_cost_does_not_grow_with_history():
         for i in range(offset + 1, offset + n + 1):
             run = f"run-{i:05d}"
             svc.ingest(_ev(run, pid, "s", EventType.STARTED, 1, float(i)))
-            svc.ingest(_ev(run, pid, "f", EventType.FAILED, 2, float(i) + 0.5,
-                           ec=ErrorClass.RETRYABLE))
+            svc.ingest(
+                _ev(
+                    run,
+                    pid,
+                    "f",
+                    EventType.FAILED,
+                    2,
+                    float(i) + 0.5,
+                    ec=ErrorClass.RETRYABLE,
+                )
+            )
 
     def query_burst(repeat=2000):
         start = _time.perf_counter()
@@ -275,7 +340,9 @@ def test_pipeline_health_query_cost_does_not_grow_with_history():
     t_large = query_burst()
     logger.info(
         "[查询成本] 500 运行: %.4fs/2000次；5000 运行: %.4fs/2000次（比值 %.2f，应接近 1）",
-        t_small, t_large, t_large / t_small,
+        t_small,
+        t_large,
+        t_large / t_small,
     )
     # 物化聚合：历史增长 10 倍，查询耗时不应同比例增长（放宽到 4 倍容纳调度噪声）
     assert t_large < t_small * 4.0

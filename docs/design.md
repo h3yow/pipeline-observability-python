@@ -96,6 +96,37 @@ RUNNING ──STARTED(更高 version)──▶ RUNNING   # 重复启动/运行�
   才允许再次计数。
 - `PENDING / RUNNING` 不产生失败告警。
 
+### 4.1 失败原因字段：展示范围与清空时机
+
+失败上报携带的 `error_class`（`RETRYABLE/FATAL`）与 `error_message`（原文）会在以下
+三处一致展示“最近一次失败为什么挂”：
+
+| 位置 | 字段 |
+| --- | --- |
+| 运行明细 `PipelineStatus` | `last_error_class`、`last_error_message`、`failure_termination` |
+| 管道汇总 `PipelineHealth` | `latest_failure_run_id/at`、`latest_failure_error_class/message`、`latest_failure_termination` |
+| 活动失败告警 `ActiveAlertView` | `error_class`、`error_message`、`termination` |
+
+`failure_termination` / `termination` 用可枚举的两类终止原因把“为什么不再重试”讲清楚：
+
+- `FATAL`：**错误本身不可重试**（状态 `FAILED_FATAL`），立即终止、不消耗后续退避；
+- `RETRY_EXHAUSTED`：**错误可重试，但重试机会已用尽**（状态仍为 `FAILED_RETRYABLE`
+  且 `retry_exhausted=True`）；
+- `NOT_TERMINATED`：尚未终止（运行中/等待重试），或已恢复成功。
+
+失败告警依据文本据此区分（例如“错误本身不可重试（FATAL），立即终止”与
+“错误可重试（RETRYABLE），但重试机会已用尽，停止重试”），**FATAL 不再被误导性地
+写成“重试耗尽”**。
+
+**清空时机（不残留旧错误）**：
+
+- 从未失败：三个错误字段均为空、`failure_termination=NOT_TERMINATED`；
+- 运行一旦 `SUCCEEDED` 恢复成功：该运行的错误分类/信息立即清空，
+  `failure_termination` 回到 `NOT_TERMINATED`；
+- 管道汇总的“最近一次失败”只统计**当前仍处于失败终态**的运行（`failure_infos`
+  随运行成功即删除），因此当全部运行恢复后，管道级失败原因整体清空为 `None`；
+- 运行被保留策略淘汰后，其失败原因随记录与聚合贡献一并移除。
+
 汇总快照 `PipelineStatus` 在锁内一次性构造，字段彼此自洽；并发读取者永远只能看到
 某个已提交版本的完整结论，看不到半成品字段。
 
@@ -114,6 +145,9 @@ RUNNING ──STARTED(更高 version)──▶ RUNNING   # 重复启动/运行�
 | `active_failure_alert_count` / `active_staleness_alert_count` | 两类活动告警数量（性质不同，分开计数，可同时 > 0）。 |
 | `has_failure_alert` / `has_staleness_alert` | 是否存在对应类别活动告警。 |
 | `staleness_threshold_seconds` / `checked_at` | 最近一次巡检使用的阈值与巡检时刻。 |
+| `latest_failure_run_id` / `latest_failure_at` | 当前仍失败的运行中，最近一次失败的运行与时间；全部恢复后为 `None`。 |
+| `latest_failure_error_class` / `latest_failure_error_message` | 该最近一次失败的错误分类（`RETRYABLE/FATAL`）与错误信息原文。 |
+| `latest_failure_termination` | 该失败的终止原因：`FATAL`（不可重试）或 `RETRY_EXHAUSTED`（机会用尽）。 |
 
 活动告警的**完整明细**（哪条运行、哪一类、依据、首次产生时间、版本）通过
 `service.active_alerts(pipeline_id, kind=...)` 惰性展开。健康快照主体只保留计数，
@@ -142,11 +176,45 @@ RUNNING ──STARTED(更高 version)──▶ RUNNING   # 重复启动/运行�
 - 管道下多个运行的更新在「先实例锁、后管道锁」的固定加锁顺序下串行进入同一管道临界区，
   因此并发上报不丢更新；健康快照在管道锁内一次性构造，读不到半截中间态。
 
-**保留策略（内存实现的对外口径）**：当前为**进程内、内存态**实现，保留自进程启动以来
-观测到的全部运行；内存占用与“历史不同运行数 + 失败终态上报次数”同阶（成功且不再失败的
-运行只留 run_id 与标量贡献，不堆积堆项）。它不做磁盘持久化，重启即清空，适合作为单实例
-观测侧/sidecar。跨进程横向扩展、超长期留存或 TTL 淘汰属于存储后端的职责，接入持久化后端
-时应以同样的物化聚合表 + 水位/堆（或定时聚合任务）保持查询口径与复杂度不变。
+**保留与淘汰策略（明确上限，内存不再无限增长）**：
+
+- **上限**：`max_retained_runs`（`PipelineStore` / `ObservabilityService` 构造参数，
+  默认 `10000`）是保留的**不同运行实例数硬上限**。
+- **淘汰规则**：新运行要占名额时，若保留数已达上限，先在同一 `registry_lock` 临界区内
+  淘汰一个“最近事件时间最旧”的运行（同时间按 `run_id` 字典序决胜，确定性），再插入
+  新运行。淘汰候选用最小堆 + 每 run 最新标记惰性维护；因此**任何时刻保留数都不越上限**，
+  读者不会看到 `cap+1`，也不会看到“记录已删、聚合仍计入”的中间态。
+- **原子摘除**：淘汰在「registry_lock → 被淘汰实例锁 → 管道锁」的嵌套临界区内完成
+  “标记墓碑 → 剔除管道聚合贡献（run_ids/失败索引/失败原因/两类告警镜像/最近事件重算）
+  → 摘除记录与锁”。写入路径的锁序为「实例锁 → 管道锁」，不含 registry，两路径无环、
+  无死锁。
+- **累计淘汰量与口径披露**：`service.retention_status()` 返回
+  `RetentionStatus(max_runs, retained_runs, evicted_runs, policy="drop_oldest")`；
+  HTTP 暴露为 `GET /retention`。`evicted_runs` 为进程内累计淘汰的不同运行数（只增不减）。
+  需要强一致地校验“保留数 == 明细条数”时，用 `service.retained_runs_view()`，
+  它在同一把 registry 锁内一次性返回（保留口径, 保留运行 ID 集合）。
+- **被淘汰运行的查询结果一致明确**：`service.lookup_run(run_id)` 返回 `RunLookup`：
+  - `FOUND`：运行仍在保留窗口，`status` 为锁内完整快照；
+  - `EVICTED`：曾被观测但已淘汰，`status=None` 且 `detail` 说明口径；
+  - `UNKNOWN`：从未观测。
+  三者都不抛错、不返回残缺数据。旧接口 `service.status(run_id)` 对“不存在/已淘汰”
+  统一返回 `None`（语义不变）；HTTP `GET /runs/{id}` 分别返回 200 / 410(EVICTED) /
+  404(UNKNOWN)。
+- **被淘汰运行不再复活**：淘汰时实例锁转为**持久墓碑**（`run_id → 墓碑锁`），
+  此后任何同 ID 事件（含迟到、重复、更高 version）一律 `REJECTED/RUN_EVICTED`，
+  也不会再进入任何管道聚合。墓碑只保留 run_id 与一枚锁，不含事件集合、堆项与聚合，
+  体量远小于完整运行历史，是幂等去重/防还魂的必要代价；完整运行状态、失败明细与
+  聚合贡献仍严格受 `max_retained_runs` 约束。另有一个定长（最近 `max_runs` 个）的
+  EVICTED ID 登记表，仅用于把查询结论细分为 EVICTED/UNKNOWN，更早的历史 ID 查询可
+  归为 UNKNOWN，但其再上报仍被墓碑拒绝。
+- **查询成本**：健康汇总为 O(1) 物化标量/计数读取；“最近一次失败原因”用失败信息
+  最大堆惰性清理，堆项随保留上界定长。因此即便累计历史运行不断增长（持续淘汰），
+  只要保留集合大小不变，健康查询耗时就不随累计历史线性变慢（见
+  `test_health_query_cost_does_not_grow_as_history_evicts`）。
+
+本实现为**进程内、内存态**，不做磁盘持久化、重启即清空，适合作为单实例观测侧/sidecar。
+跨进程横向扩展或超长期留存属于持久化存储后端的职责；接入后端时应以同样的物化聚合表 +
+水位/堆 + 显式保留窗口（或 TTL/分区淘汰）保持查询口径与复杂度不变。
 
 ## 6. 失新鲜监控（自动告警 + 确定性巡检）
 
@@ -169,8 +237,9 @@ RUNNING ──STARTED(更高 version)──▶ RUNNING   # 重复启动/运行�
   按范围巡检，返回 `{run_id: StalenessVerdict}`；
 - 时刻 `now` 取自注入时钟（测试可注入可控时钟），也可在调用时显式传入。
 - **时间契约**：巡检时刻 `now` 必须单调不减、且不早于已应用事件的时间——这与真实周期性
-  调度一致。系统不接受“拿更早的旧时刻对已推进到更晚基线的实例再判一次”这类乱序巡检：
-  那样会把一个已被更新成功覆盖的实例重新判成失新鲜。需要重放历史请用独立的服务实例。
+  调度一致。若传入早于 `last_checked_at` 的旧时刻（乱序巡检），系统**原样返回上一次
+  判定结论**，不刷新任何字段、不开关告警、不增减计数：既不会把已恢复实例重新判成失新鲜，
+  也不会让旧的“失新鲜”结论回潮。需要重放历史请用独立的服务实例。
 
 收敛规则（`StalenessAlertState`，与失败告警完全分开）：
 
@@ -179,41 +248,65 @@ RUNNING ──STARTED(更高 version)──▶ RUNNING   # 重复启动/运行�
 - 持续失新鲜期间反复巡检：**只告警一次、只计一次**，仅刷新判定依据；
 - 恢复新鲜（重新成功，或在新基线下回到窗口内）：关闭活动告警、记录恢复时刻；
   再次失新鲜才算新段落，才允许再计一次。
-- 收到成功事件时会在**同一写入临界区**立即关闭该运行的失新鲜告警（不必等下轮巡检），
-  保证成功后查询不会短暂看到“已成功但仍挂着失新鲜”的中间态。
+
+### 6.1 成功恢复后明细口径（活动状态与判定依据一起更新）
+
+修复前只把 `staleness_alert_active` 置 false、却保留上一版“失新鲜”判定依据，导致同一份
+明细自相矛盾（告警已关、结论仍停在失新鲜）。现在收到成功事件时，在**同一写入临界区**内
+通过 `recover_staleness_on_success(...)` 原子完成：
+
+1. 关闭活动失新鲜告警、清空 `raised_at`，并记录恢复时刻
+   `staleness_last_recovered_at`（= 成功事件时间）；
+2. **同时**把 `last_verdict` 刷新为“恢复/新鲜”结论：基线切换为
+   `LAST_SUCCESS(成功时间)`、`age=0`、在窗口内，依据文本明确写出**恢复时刻**与
+   “本段失新鲜告警同步关闭”。因此恢复后任何查询读到的都是新鲜结论；
+3. 管道侧失新鲜告警镜像在同一临界区撤销，健康汇总不会露出已恢复的告警；
+4. 同一段失新鲜结束后再巡检（含恢复同刻、更晚时刻）不重复报警、不重复计数；
+   传入更早旧时刻的乱序巡检按 §6 时间契约原样返回新鲜结论，旧结论永不回潮。
 
 ## 7. 两类告警的关系：分开、可并存、各自恢复
 
 - 失败告警（`AlertKind.FAILURE`）由状态机失败终态驱动；失新鲜告警
   （`AlertKind.STALENESS`）由时间基线驱动。两者性质不同，分别有独立的活动标志、计数、
   首次产生时间与判定依据，因此**可能同时存在**（例如：早就失败了，且距上次成功也已超阈值）。
-- 实例明细 `PipelineStatus` 新增：
+- 实例明细 `PipelineStatus` 的扩展字段：
   `pipeline_id`、`staleness_alert_active`、`staleness_alert_reason`、
   `staleness_raised_count`、`active_alert_kinds`（当前活动告警类别元组，如
-  `("FAILURE","STALENESS")`）。旧字段 `alert_active / alert_reason` 仍只表示失败告警，
-  含义不变。
-- 管道汇总用两组计数/标志与 `active_alerts()` 明细区分两类；成功恢复会同时关闭该运行的
-  两类活动告警，但二者也能各自独立出现/消失（如运行中先失新鲜、后失败；或只失新鲜未失败）。
+  `("FAILURE","STALENESS")`）、`staleness_last_recovered_at`（最近失新鲜恢复时刻），
+  以及失败原因三件套 `last_error_class`、`last_error_message`、`failure_termination`。
+  旧字段 `alert_active / alert_reason` 仍只表示失败告警，含义不变。
+- 管道汇总用两组计数/标志与 `active_alerts()` 明细区分两类；失败告警明细
+  （`ActiveAlertView`）额外带 `error_class / error_message / termination`；
+  成功恢复会同时关闭该运行的两类活动告警，但二者也能各自独立出现/消失
+  （如运行中先失新鲜、后失败；或只失新鲜未失败）。
 
 ## 8. 并发安全模型
 
-- 每个 `pipeline_run_id` 一把实例锁（惰性创建，注册表另用短锁保护），同一实例的更新完全
-  串行化；每个 `pipeline_id` 再一把管道锁保护聚合。
-- 加锁顺序固定为「实例锁 → 管道锁」（单向，不存在反向获取），因此无死锁；不同实例/管道
-  互不阻塞。
+- 每个 `pipeline_run_id` 一把实例锁（带墓碑位），同一实例的更新完全串行化；
+  每个 `pipeline_id` 再一把管道锁保护聚合；另有一把 `registry_lock` 保护
+  运行记录表、淘汰堆与墓碑/登记结构。
+- 加锁顺序：写入路径为「实例锁 → 管道锁」；淘汰路径为
+  「registry_lock → 被淘汰实例锁 → 管道锁」（淘汰发生在新运行占名额之前，
+  淘汰线程尚未持有新运行的实例锁）。registry 只在淘汰/创建路径出现且位于最外层，
+  两条路径不成环，因此无死锁；不同实例/管道互不阻塞。
 - 事件接收、计数、重试调度、失败告警、失新鲜成功恢复、管道聚合更新都在同一实例临界区及
-  其嵌套的管道临界区完成；实例快照与管道快照分别在对应锁内一次性构造，均为不可变值对象。
+  其嵌套的管道临界区完成；**淘汰的“记录摘除 + 管道聚合剔除”也在同一嵌套临界区完成**，
+  读者看不到“记录已删但聚合仍计入”或保留数越界的中间态。实例快照与管道快照分别在对应
+  锁内一次性构造，均为不可变值对象。
+- 只有真正 `APPLIED` 的写入才会登记淘汰候选；`DUPLICATE / REJECTED` 不入堆、不触发淘汰，
+  避免重复/乱序事件造成多计淘汰量。
 
 ## 9. HTTP 接口（main.py）
 
 | 方法/路径 | 说明 |
 | --- | --- |
-| `POST /events` | 上报事件（新增**可选**字段 `pipeline_id`）。成功 200；重复幂等 200；冲突/拒绝 409 带 `reason`。 |
-| `GET /runs/{run_id}` | 查询单个实例汇总；旧字段全部保留，末尾追加管道与失新鲜新字段；不存在 404。 |
-| `GET /runs` | 列出全部实例 ID。 |
+| `POST /events` | 上报事件（可选字段 `pipeline_id / error_class / error_message`）。成功 200；重复幂等 200；冲突/拒绝 409 带 `reason`（含新增 `RUN_EVICTED`）。 |
+| `GET /runs/{run_id}` | 查询单个实例汇总；旧字段全部保留，末尾追加失新鲜恢复时刻与失败原因三件套；保留中 200，**已淘汰 410（body `outcome=EVICTED` 并带保留口径），从不知晓 404**。 |
+| `GET /runs` | 列出全部在保留窗口内的实例 ID。 |
 | `GET /pipelines` | 列出全部管道 ID。 |
-| `GET /pipelines/{pipeline_id}/health` | 管道级健康汇总（含两类告警计数与明细）；不存在 404。 |
+| `GET /pipelines/{pipeline_id}/health` | 管道级健康汇总（含两类告警计数、明细及最近一次失败原因）；管道下无有效运行 404。 |
 | `POST /staleness/sweep` | 按需触发失新鲜巡检；body 可选 `pipeline_id / run_id / fresh_within_seconds / now`。 |
+| `GET /retention` | 历史保留口径：`max_runs / retained_runs / evicted_runs / policy`。 |
 
 ### 9.1 新旧兼容范围
 
@@ -225,26 +318,47 @@ RUNNING ──STARTED(更高 version)──▶ RUNNING   # 重复启动/运行�
   追加在末尾），旧的位置构造与字段读取不被打断。
 - 旧方法签名保持兼容：`staleness_report(run_id, fresh_within_seconds=None)`、
   `is_stale(...)`、`status/all_status/ingest` 均不变；阈值缺省回落到服务级默认值。
+- **本轮新增能力均为“可选入参 + 末尾追加字段 + 新增枚举值/新接口”，不破坏旧调用**：
+  - `ObservabilityService(..., max_retained_runs=None)`、`PipelineStore(max_retained_runs=...)`
+    为新增可选参数；缺省取默认上限 `10000`，旧的无参构造行为不变（仅多了保留上限）。
+  - `PipelineStatus / PipelineHealth / ActiveAlertView` 新增字段全部带默认值并追加在末尾，
+    旧的位置构造与字段读取不被打断；旧字段含义不变。
+  - 失败告警评估 `evaluate_alert(...)` 新增可选关键字 `error_class/error_message`；
+    失新鲜恢复新增独立函数 `recover_staleness_on_success(...)`，旧调用不报错。
+  - 新增 `RejectReason.RUN_EVICTED`、`LookupOutcome`、`RunLookup`、`RetentionStatus`、
+    `FailureTermination` 与 `service.lookup_run() / retention_status() /
+    retained_runs_view()`；旧代码只需把未知的拒绝原因按“已拒绝”通用处理。
+  - `status(run_id)` 仍对不存在/已淘汰返回 `None`；需要区分二者时改用 `lookup_run()`。
 
 ## 10. 验证方法
 
 ```bash
 uv sync
-uv run pytest -s
+uv run pytest -s                 # 打印事件时间线与判定依据
+uv run pytest -q                 # 静默模式快速回归
+uv run ruff check pipeline_obs main.py tests && uv run ruff format pipeline_obs main.py tests
+uv run fastapi dev main.py       # 启动后可访问 /retention、/runs/{id}、/pipelines/{id}/health
 ```
 
-测试运行时通过 `timeline` logger 打印**事件时间线、逐条判定依据、失新鲜判定（基线/时间差/
-阈值/结论）与管道健康汇总/活动告警明细**。
+测试全部使用**注入时钟/显式 `now`** 确定性驱动，不依赖真实 sleep；并通过 `timeline`
+logger 打印**事件时间线、逐条判定依据、失败错误分类/信息/终止原因、失新鲜判定
+（基线/时间差/阈值/结论/恢复时刻）、保留口径与管道健康/活动告警明细**。
 
 - `tests/test_retry.py`：退避序列与封顶、达到上限停止、FATAL 不重试且原因可区分。
 - `tests/test_state_machine.py`：乱序拒绝、重复幂等不计数、同 attempt 冲突结果、FATAL 终态后拒绝。
 - `tests/test_alerting.py`：同一失败异常恢复前只告警一次、恢复后新异常重新计数、时效判定依据。
 - `tests/test_concurrency.py`：并发重复上报、重试链重复投递、乱序批次、1 写 8 读快照不变量。
-- `tests/test_pipeline_health.py`（新增）：
-  - 40 个运行、每事件重复 4 次并发提交 + 8 个持续读取者：管道汇总不丢更新、无中间态，
-    连续失败数与活动失败告警数恰为运行数；
-  - 失新鲜“进入 → 持续多次巡检 → 成功恢复 → 再次失新鲜”：第一段只告警/计数一次，
-    新段落才再计一次，基线在 FIRST_REPORT 与 LAST_SUCCESS 间正确切换；
-  - 失败告警与失新鲜告警并存、各自独立恢复，`active_alert_kinds` 与管道两类计数正确；
-  - 跨多运行混合成功/失败 + 成功水位抬升：连续失败数精确；
-  - 历史从 500 增至 5000 个运行：健康查询耗时基本恒定（实测比值约 1，物化聚合非全量扫描）。
+- `tests/test_pipeline_health.py`：多运行并发汇总、失新鲜段落收敛、两类告警并存独立恢复、
+  成功水位精确剔除、历史 500→5000 健康查询耗时恒定。
+- `tests/test_recovery_consistency.py`（**本轮新增**）：失新鲜成功恢复后
+  “活动标志 + 判定依据 + 恢复时刻”一致为新鲜；恢复后再巡检/乱序旧时刻巡检不重复报警、
+  旧结论不回潮；失败+失新鲜并存时成功同时关闭两类。
+- `tests/test_failure_reason.py`（**本轮新增**）：运行明细/管道汇总/活动告警三处可见最近
+  一次失败的错误分类与信息；`FATAL` 与 `RETRY_EXHAUSTED` 依据可区分；最近失败跟随最新失败
+  运行、成功恢复后清空、从未失败不残留。
+- `tests/test_retention.py`（**本轮新增**）：超上限 drop-oldest 淘汰、保留/累计淘汰口径
+  披露、被淘汰运行 EVICTED/UNKNOWN/FOUND 一致查询与不可复活、旧运行更新不误伤新运行、
+  累计历史 1000→5000（持续淘汰、保留恒为 500）健康查询耗时仍恒定。
+- `tests/test_retention_concurrency.py`（**本轮新增**）：同一管道 800 个运行、每事件重复
+  3 份并发提交 + 8 个持续读取者：保留数任何时刻不越上限、累计淘汰恰为
+  “观测数−上限”、管道计数/告警/失败原因始终自洽、被淘汰 ID 一律 `RUN_EVICTED`。

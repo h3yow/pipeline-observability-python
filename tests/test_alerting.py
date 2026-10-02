@@ -29,14 +29,21 @@ def _svc(now=1000.0):
 
 def _ev(run, eid, etype, version, attempt=1, ec=None):
     return PipelineEvent(
-        run, eid, etype, occurred_at=float(version),
-        version=version, attempt=attempt, error_class=ec,
+        run,
+        eid,
+        etype,
+        occurred_at=float(version),
+        version=version,
+        attempt=attempt,
+        error_class=ec,
     )
 
 
 def test_single_alert_until_recovery_then_new_alert():
     svc, _t = _svc(now=10.0)
-    logger.info("==== 场景：失败→多次重试失败（不重复告警）→恢复→再次失败（新告警）====")
+    logger.info(
+        "==== 场景：失败→多次重试失败（不重复告警）→恢复→再次失败（新告警）===="
+    )
     script = [
         _ev("run-alert", "e1", EventType.STARTED, 1, 1),
         _ev("run-alert", "e2", EventType.FAILED, 2, 1, ErrorClass.RETRYABLE),
@@ -66,24 +73,52 @@ def test_alert_count_via_direct_state():
     from pipeline_obs.alerting import evaluate_alert
 
     alert = AlertState()
-    evaluate_alert(alert, state=PipelineState.FAILED_RETRYABLE, retry_exhausted=False, version=1)
-    evaluate_alert(alert, state=PipelineState.FAILED_RETRYABLE, retry_exhausted=False, version=2)
-    evaluate_alert(alert, state=PipelineState.FAILED_RETRYABLE, retry_exhausted=True, version=3)
-    logger.info("[收敛计数] 连续 3 次失败态评估 raised_count=%d（预期 1）", alert.raised_count)
+    evaluate_alert(
+        alert, state=PipelineState.FAILED_RETRYABLE, retry_exhausted=False, version=1
+    )
+    evaluate_alert(
+        alert, state=PipelineState.FAILED_RETRYABLE, retry_exhausted=False, version=2
+    )
+    evaluate_alert(
+        alert, state=PipelineState.FAILED_RETRYABLE, retry_exhausted=True, version=3
+    )
+    logger.info(
+        "[收敛计数] 连续 3 次失败态评估 raised_count=%d（预期 1）", alert.raised_count
+    )
     assert alert.raised_count == 1
-    evaluate_alert(alert, state=PipelineState.SUCCEEDED, retry_exhausted=False, version=4)
-    evaluate_alert(alert, state=PipelineState.FAILED_FATAL, retry_exhausted=True, version=5)
+    evaluate_alert(
+        alert, state=PipelineState.SUCCEEDED, retry_exhausted=False, version=4
+    )
+    evaluate_alert(
+        alert, state=PipelineState.FAILED_FATAL, retry_exhausted=True, version=5
+    )
     logger.info("[恢复后新异常] raised_count=%d（预期 2）", alert.raised_count)
     assert alert.raised_count == 2
 
 
 def test_staleness_based_on_last_success():
     svc, t = _svc(now=100.0)
-    svc.ingest(PipelineEvent(
-        "run-stale", "e1", EventType.STARTED, occurred_at=100.0, version=1, attempt=1))
+    svc.ingest(
+        PipelineEvent(
+            "run-stale",
+            "e1",
+            EventType.STARTED,
+            occurred_at=100.0,
+            version=1,
+            attempt=1,
+        )
+    )
     t["v"] = 102.0
-    svc.ingest(PipelineEvent(
-        "run-stale", "e2", EventType.SUCCEEDED, occurred_at=102.0, version=2, attempt=1))
+    svc.ingest(
+        PipelineEvent(
+            "run-stale",
+            "e2",
+            EventType.SUCCEEDED,
+            occurred_at=102.0,
+            version=2,
+            attempt=1,
+        )
+    )
     t["v"] = 106.0
     stale, why = svc.staleness_report("run-stale", fresh_within_seconds=3.0)
     logger.info("[时效判定] %s -> stale=%s", why, stale)

@@ -19,9 +19,15 @@ def test_backoff_is_exponential_and_capped():
 
 def test_retryable_schedules_with_backoff_until_limit():
     policy = RetryPolicy(max_attempts=3, base_delay_seconds=1.0, multiplier=2.0)
-    d1 = decide_retry(policy, failed_attempt=1, error_class=ErrorClass.RETRYABLE, now=0.0)
-    d2 = decide_retry(policy, failed_attempt=2, error_class=ErrorClass.RETRYABLE, now=0.0)
-    d3 = decide_retry(policy, failed_attempt=3, error_class=ErrorClass.RETRYABLE, now=0.0)
+    d1 = decide_retry(
+        policy, failed_attempt=1, error_class=ErrorClass.RETRYABLE, now=0.0
+    )
+    d2 = decide_retry(
+        policy, failed_attempt=2, error_class=ErrorClass.RETRYABLE, now=0.0
+    )
+    d3 = decide_retry(
+        policy, failed_attempt=3, error_class=ErrorClass.RETRYABLE, now=0.0
+    )
     logger.info("[重试判定] a1=%s", d1.reason)
     logger.info("[重试判定] a2=%s", d2.reason)
     logger.info("[重试判定] a3=%s", d3.reason)

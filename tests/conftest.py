@@ -15,4 +15,6 @@ timeline_log = logging.getLogger("timeline")
 
 @pytest.fixture
 def service():
-    return ObservabilityService(retry_policy=RetryPolicy(max_attempts=3, base_delay_seconds=0.01))
+    return ObservabilityService(
+        retry_policy=RetryPolicy(max_attempts=3, base_delay_seconds=0.01)
+    )

@@ -43,7 +43,9 @@ def post_event(payload: EventIn):
         pipeline_run_id=payload.pipeline_run_id,
         event_id=payload.event_id,
         event_type=payload.event_type,
-        occurred_at=payload.occurred_at if payload.occurred_at is not None else time.time(),
+        occurred_at=payload.occurred_at
+        if payload.occurred_at is not None
+        else time.time(),
         version=payload.version,
         attempt=payload.attempt,
         error_class=payload.error_class,
@@ -73,9 +75,30 @@ def post_event(payload: EventIn):
 
 @app.get("/runs/{run_id}")
 def get_run(run_id: str):
-    snap = service.status(run_id)
-    if snap is None:
-        return JSONResponse({"detail": "run not found"}, status_code=404)
+    # 统一走 lookup：保留中→完整快照；已淘汰→410 明确口径；从不知晓→404。
+    # 三者都返回结构化、自洽的结果，不抛 500、不返回残缺数据。
+    lookup = service.lookup_run(run_id)
+    if lookup.outcome.value == "UNKNOWN":
+        return JSONResponse(
+            {"detail": "run not found", "outcome": "UNKNOWN"}, status_code=404
+        )
+    if lookup.outcome.value == "EVICTED":
+        rs = service.retention_status()
+        return JSONResponse(
+            {
+                "outcome": "EVICTED",
+                "pipeline_run_id": run_id,
+                "detail": lookup.detail,
+                "retention": {
+                    "max_runs": rs.max_runs,
+                    "retained_runs": rs.retained_runs,
+                    "evicted_runs": rs.evicted_runs,
+                    "policy": rs.policy,
+                },
+            },
+            status_code=410,
+        )
+    snap = lookup.status
     # 旧字段全部保留，仅在末尾追加新字段（向后兼容）
     return {
         "pipeline_run_id": snap.pipeline_run_id,
@@ -96,6 +119,11 @@ def get_run(run_id: str):
         "staleness_alert_active": snap.staleness_alert_active,
         "staleness_alert_reason": snap.staleness_alert_reason,
         "staleness_raised_count": snap.staleness_raised_count,
+        "staleness_last_recovered_at": snap.staleness_last_recovered_at,
+        # —— 新增：最近一次失败原因（成功恢复后为 null，不残留旧错误）——
+        "last_error_class": snap.last_error_class,
+        "last_error_message": snap.last_error_message,
+        "failure_termination": snap.failure_termination,
     }
 
 
@@ -132,6 +160,12 @@ def get_pipeline_health(pipeline_id: str):
         "has_staleness_alert": h.has_staleness_alert,
         "staleness_threshold_seconds": h.staleness_threshold_seconds,
         "checked_at": h.checked_at,
+        # —— 新增：当前仍失败运行中最近一次失败的错误分类/信息/终止原因 ——
+        "latest_failure_run_id": h.latest_failure_run_id,
+        "latest_failure_at": h.latest_failure_at,
+        "latest_failure_error_class": h.latest_failure_error_class,
+        "latest_failure_error_message": h.latest_failure_error_message,
+        "latest_failure_termination": h.latest_failure_termination,
         "active_alerts": [
             {
                 "pipeline_run_id": a.pipeline_run_id,
@@ -139,9 +173,24 @@ def get_pipeline_health(pipeline_id: str):
                 "reason": a.reason,
                 "since": a.since,
                 "version": a.version,
+                "error_class": a.error_class,
+                "error_message": a.error_message,
+                "termination": a.termination,
             }
             for a in service.active_alerts(pipeline_id)
         ],
+    }
+
+
+@app.get("/retention")
+def get_retention():
+    """历史保留口径：保留上限、当前保留运行数、累计淘汰运行数与淘汰规则。"""
+    rs = service.retention_status()
+    return {
+        "max_runs": rs.max_runs,
+        "retained_runs": rs.retained_runs,
+        "evicted_runs": rs.evicted_runs,
+        "policy": rs.policy,
     }
 
 

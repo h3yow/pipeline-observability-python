@@ -30,6 +30,41 @@ from .models import (
 )
 
 
+@dataclass(frozen=True)
+class _FailureInfo:
+    """某运行当前失败终态的最近一次失败信息（随该运行成功/淘汰而删除）。"""
+
+    at: float
+    state: PipelineState
+    error_class: str | None
+    error_message: str | None
+    termination: str  # FATAL / RETRY_EXHAUSTED / NOT_TERMINATED
+    version: int
+
+
+class _LatestKey:
+    """最大堆键：按 (at, run_id) 的字典序取“最大”（与 _bump_latest 决胜口径一致）。
+
+    包一层反转比较，使 heapq（最小堆）弹出的永远是最近一次失败；
+    同时间戳时 run_id 字典序更大者优先，保证确定性。
+    """
+
+    __slots__ = ("at", "run_id")
+
+    def __init__(self, at: float, run_id: str) -> None:
+        self.at = at
+        self.run_id = run_id
+
+    def __lt__(self, other: _LatestKey) -> bool:
+        return (self.at, self.run_id) > (other.at, other.run_id)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _LatestKey) and (self.at, self.run_id) == (
+            other.at,
+            other.run_id,
+        )
+
+
 @dataclass
 class _PipelineAggregate:
     """单个管道的聚合可变状态。仅在持有 lock 时访问。"""
@@ -38,6 +73,9 @@ class _PipelineAggregate:
     lock: threading.Lock = field(default_factory=threading.Lock)
     # 归属该管道的全部运行实例
     run_ids: set[str] = field(default_factory=set)
+    # 各运行的最近事件键 (at, run_id)：用于某运行被淘汰后重算“管道最近事件”，
+    # 同时保证该结构随保留上界定长，不随全历史增长。
+    run_latest: dict[str, tuple[float, PipelineState]] = field(default_factory=dict)
     # 管道最近一次事件（标量随 ingest 单调推进，O(1) 更新）
     latest_event_at: float | None = None
     latest_run_id: str | None = None
@@ -50,6 +88,10 @@ class _PipelineAggregate:
     failure_index: dict[str, float] = field(default_factory=dict)
     # 失败时间最小堆 (failed_at, run_id)：水位抬升时批量剔除越界贡献
     failure_heap: list[tuple[float, str]] = field(default_factory=list)
+    # 各运行当前失败终态的失败信息：run_id -> _FailureInfo（成功/淘汰即删）
+    failure_infos: dict[str, _FailureInfo] = field(default_factory=dict)
+    # 失败信息最大堆 (_LatestKey(at, run_id), run_id)：惰性清理，健康查询 O(1) 取最近一次
+    latest_failure_heap: list[tuple[_LatestKey, str]] = field(default_factory=list)
     # 活动告警镜像：run_id -> 告警视图（两类分开存放，可并存、各自恢复）
     failure_alerts: dict[str, ActiveAlertView] = field(default_factory=dict)
     staleness_alerts: dict[str, ActiveAlertView] = field(default_factory=dict)
@@ -84,7 +126,14 @@ class PipelineRegistry:
     def _bump_latest(
         agg: _PipelineAggregate, run_id: str, state: PipelineState, at: float
     ) -> None:
-        """推进“管道最近事件”标量；同时间以 run_id 字典序保证确定性。"""
+        """推进“管道最近事件”标量并记录该运行自身的最近事件（供淘汰后重算）。
+
+        同时间以 run_id 字典序保证确定性。迟到事件（version 已被实例层拦截）
+        不会覆盖该运行已记录的更新事件。
+        """
+        cur_run = agg.run_latest.get(run_id)
+        if cur_run is None or at >= cur_run[0]:
+            agg.run_latest[run_id] = (at, state)
         cur_key = (
             agg.latest_event_at,
             agg.latest_run_id if agg.latest_run_id is not None else "",
@@ -93,6 +142,19 @@ class PipelineRegistry:
             agg.latest_event_at = at
             agg.latest_run_id = run_id
             agg.latest_run_state = state
+
+    @staticmethod
+    def _recompute_latest(agg: _PipelineAggregate) -> None:
+        """从剩余成员重算“管道最近事件”（某运行被淘汰后调用，已持锁）。"""
+        if not agg.run_latest:
+            agg.latest_event_at = None
+            agg.latest_run_id = None
+            agg.latest_run_state = None
+            return
+        rid, (at, state) = max(agg.run_latest.items(), key=lambda kv: (kv[1][0], kv[0]))
+        agg.latest_event_at = at
+        agg.latest_run_id = rid
+        agg.latest_run_state = state
 
     def note_started(self, pipeline_id: str, run_id: str, *, at: float) -> None:
         """STARTED 事件已应用：登记归属并推进“最近事件”标量。
@@ -116,12 +178,27 @@ class PipelineRegistry:
         alert_reason: str | None,
         raised_at: float | None,
         version: int,
+        error_class: str | None = None,
+        error_message: str | None = None,
+        termination: str = "NOT_TERMINATED",
     ) -> None:
-        """FAILED 事件已应用：推进最近事件、维护失败索引/连续失败数与失败告警镜像。"""
+        """FAILED 事件已应用：推进最近事件、维护失败索引/连续失败数/失败原因与失败告警镜像。"""
         agg = self._aggregate(pipeline_id)
         with agg.lock:
             agg.run_ids.add(run_id)
             self._bump_latest(agg, run_id, state, at)
+
+            # 最近一次失败原因（全量记录当前失败运行，与是否计入连续失败数无关）
+            info = _FailureInfo(
+                at=at,
+                state=state,
+                error_class=error_class,
+                error_message=error_message,
+                termination=termination,
+                version=version,
+            )
+            agg.failure_infos[run_id] = info
+            heapq.heappush(agg.latest_failure_heap, (_LatestKey(at, run_id), run_id))
 
             old = agg.failure_index.get(run_id)
             if old is None:
@@ -140,23 +217,22 @@ class PipelineRegistry:
 
             if alert_active:
                 existing = agg.failure_alerts.get(run_id)
-                if existing is None:
-                    agg.failure_alerts[run_id] = ActiveAlertView(
-                        pipeline_run_id=run_id,
-                        kind=AlertKind.FAILURE,
-                        reason=alert_reason or "实例处于失败态",
-                        since=raised_at if raised_at is not None else at,
-                        version=version,
-                    )
-                else:
-                    # 同一活动失败告警：保留首次 since，仅刷新依据与版本。
-                    agg.failure_alerts[run_id] = ActiveAlertView(
-                        pipeline_run_id=run_id,
-                        kind=existing.kind,
-                        reason=alert_reason or existing.reason,
-                        since=existing.since,
-                        version=version,
-                    )
+                since = (
+                    existing.since
+                    if existing is not None
+                    else (raised_at if raised_at is not None else at)
+                )
+                # 同一活动失败告警：保留首次 since，仅刷新依据、版本与错误原因。
+                agg.failure_alerts[run_id] = ActiveAlertView(
+                    pipeline_run_id=run_id,
+                    kind=AlertKind.FAILURE,
+                    reason=alert_reason or "实例处于失败态",
+                    since=since,
+                    version=version,
+                    error_class=error_class,
+                    error_message=error_message,
+                    termination=termination,
+                )
             else:
                 agg.failure_alerts.pop(run_id, None)
 
@@ -179,6 +255,10 @@ class PipelineRegistry:
                 agg.last_success_at is None or old > agg.last_success_at
             ):
                 agg.consecutive_failures -= 1
+
+            # 成功恢复：该运行不再是失败运行，其失败原因一并清空，
+            # 绝不允许上一次的旧错误残留在管道汇总/活动告警里。
+            agg.failure_infos.pop(run_id, None)
 
             raised = agg.last_success_at is None or at > agg.last_success_at
             if raised:
@@ -231,6 +311,45 @@ class PipelineRegistry:
                         version=existing.version,
                     )
 
+    @staticmethod
+    def _purge_latest_failure_heap(agg: _PipelineAggregate) -> None:
+        """惰性剔除 latest_failure_heap 堆顶的失效条目（成功/淘汰/重试更新留下）。
+
+        判定失效：run 已不在 failure_infos，或其中记录的失败时间与堆条目不符。
+        每个堆项至多入堆/出堆一次，整体摊还 O(log n)，调用点均已持有管道锁。
+        """
+        while agg.latest_failure_heap:
+            key, rid = agg.latest_failure_heap[0]
+            info = agg.failure_infos.get(rid)
+            if info is not None and info.at == key.at:
+                break
+            heapq.heappop(agg.latest_failure_heap)
+
+    def remove_run(self, pipeline_id: str, run_id: str) -> None:
+        """运行被保留策略淘汰：从管道聚合中剔除它的全部贡献（锁内自洽）。
+
+        - 从 run_ids / 失败索引 / 失败信息 / 两类活动告警镜像中删除；
+        - 若它仍计入连续失败数，相应扣减；
+        - 管道级标量（最近事件/最近成功水位）是随时间单调推进的历史事实，
+          淘汰旧运行不回退水位；若最近事件指向的恰好是被淘汰运行，
+          从剩余成员中重算“最近事件”（结果仍自洽）。
+        """
+        agg = self._ref(pipeline_id)
+        if agg is None:
+            return
+        with agg.lock:
+            agg.run_ids.discard(run_id)
+            agg.run_latest.pop(run_id, None)
+            agg.failure_infos.pop(run_id, None)
+            agg.failure_alerts.pop(run_id, None)
+            agg.staleness_alerts.pop(run_id, None)
+            if agg.failure_index.pop(run_id, None) is not None:
+                agg.consecutive_failures = max(0, agg.consecutive_failures - 1)
+
+            if agg.latest_run_id == run_id:
+                # 被淘汰的恰好是“最近事件运行”：从剩余成员重算，保持快照自洽。
+                self._recompute_latest(agg)
+
     def active_alerts(
         self, pipeline_id: str, *, kind: str | None = None
     ) -> tuple[ActiveAlertView, ...]:
@@ -261,6 +380,17 @@ class PipelineRegistry:
         if agg is None:
             return None
         with agg.lock:
+            # 管道下所有运行都被保留策略淘汰后，空聚合视为“当前无有效运行”，
+            # 健康查询与从不知晓一致地返回 None（空壳聚合对象仅用于内部簿记）。
+            if not agg.run_ids:
+                return None
+            self._purge_latest_failure_heap(agg)
+            latest: _FailureInfo | None = None
+            latest_run: str | None = None
+            if agg.latest_failure_heap:
+                _key, rid = agg.latest_failure_heap[0]
+                latest = agg.failure_infos.get(rid)
+                latest_run = rid
             return PipelineHealth(
                 pipeline_id=pipeline_id,
                 run_count=len(agg.run_ids),
@@ -275,6 +405,17 @@ class PipelineRegistry:
                 has_staleness_alert=bool(agg.staleness_alerts),
                 staleness_threshold_seconds=agg.staleness_threshold_seconds,
                 checked_at=agg.checked_at,
+                latest_failure_run_id=latest_run,
+                latest_failure_at=latest.at if latest is not None else None,
+                latest_failure_error_class=(
+                    latest.error_class if latest is not None else None
+                ),
+                latest_failure_error_message=(
+                    latest.error_message if latest is not None else None
+                ),
+                latest_failure_termination=(
+                    latest.termination if latest is not None else None
+                ),
             )
 
     def list_pipeline_ids(self) -> list[str]:
